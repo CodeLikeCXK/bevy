@@ -35,7 +35,7 @@ fn main() {
                 ..default()
             }),
             MeshletPlugin {
-                cluster_buffer_slots: 1 << 14,
+                cluster_buffer_slots: 1 << 18,
             },
             MaterialPlugin::<MeshletDebugMaterial>::default(),
             FreeCameraPlugin,
@@ -56,7 +56,7 @@ fn setup(
 ) {
     commands.spawn((
         Camera3d::default(),
-        Transform::from_translation(Vec3::new(1.8, 0.4, -0.1)).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_translation(Vec3::new(3.5, 2.5, 4.0)).looking_at(Vec3::ZERO, Vec3::Y),
         Msaa::Off,
         EnvironmentMapLight {
             diffuse_map: asset_server.load("environment_maps/pisa_diffuse_rgb9e5_zstd.ktx2"),
@@ -89,42 +89,55 @@ fn setup(
     let meshlet_mesh_handle = asset_server.load(ASSET_URL);
     let debug_material = debug_materials.add(MeshletDebugMaterial::default());
 
-    for x in -2..=2 {
-        let mut bunny = commands.spawn((
-            MeshletMesh3d(meshlet_mesh_handle.clone()),
-            MeshMaterial3d(standard_materials.add(StandardMaterial {
-                base_color: match x {
-                    -2 => Srgba::hex("#dc2626").unwrap().into(),
-                    -1 => Srgba::hex("#ea580c").unwrap().into(),
-                    0 => Srgba::hex("#facc15").unwrap().into(),
-                    1 => Srgba::hex("#16a34a").unwrap().into(),
-                    2 => Srgba::hex("#0284c7").unwrap().into(),
-                    _ => unreachable!(),
-                },
-                perceptual_roughness: (x + 2) as f32 / 4.0,
-                ..default()
-            })),
-            Transform::default()
-                .with_scale(Vec3::splat(0.2))
-                .with_translation(Vec3::new(x as f32 / 2.0, 0.0, -0.3)),
-        ));
-        if x == 1 {
-            bunny.insert(BunnyWiggler);
+    // 2D 网格生成：奇数行使用 Debug 材质，偶数行使用色相渐变材质
+    let grid_x = 8; // 每排 9 只 (-4..=4)
+    let grid_z = 8; // 共 9 排 (-4..=4)，总计 81 只高精度兔子
+    let spacing_x = 0.5;
+    let spacing_z = 0.6;
+
+    for z in -grid_z..=grid_z {
+        let is_debug_row = (z + grid_z) % 2 == 1; // 一排渐变色，一排 debug 材质交替
+        for x in -grid_x..=grid_x {
+            let translation = Vec3::new(x as f32 * spacing_x, 0.0, z as f32 * spacing_z);
+
+            let mut entity_cmds = if is_debug_row {
+                // Debug 材质排（面朝反方向展示不同角度特征）
+                commands.spawn((
+                    MeshletMesh3d(meshlet_mesh_handle.clone()),
+                    MeshMaterial3d(debug_material.clone()),
+                    Transform::default()
+                        .with_scale(Vec3::splat(0.2))
+                        .with_rotation(Quat::from_rotation_y(PI))
+                        .with_translation(translation),
+                ))
+            } else {
+                // 色相渐变排（使用色相环计算平滑彩虹过渡颜色）
+                let norm_x = (x + grid_x) as f32 / (2 * grid_x) as f32;
+                let hue = norm_x * 360.0;
+                let color = Hsla::hsl(hue, 0.85, 0.55).into();
+
+                commands.spawn((
+                    MeshletMesh3d(meshlet_mesh_handle.clone()),
+                    MeshMaterial3d(standard_materials.add(StandardMaterial {
+                        base_color: color,
+                        perceptual_roughness: norm_x,
+                        ..default()
+                    })),
+                    Transform::default()
+                        .with_scale(Vec3::splat(0.2))
+                        .with_translation(translation),
+                ))
+            };
+
+            // 给中心的一只兔子添加摇摆动作
+            if x == 0 && z == 0 {
+                entity_cmds.insert(BunnyWiggler);
+            }
         }
-    }
-    for x in -2..=2 {
-        commands.spawn((
-            MeshletMesh3d(meshlet_mesh_handle.clone()),
-            MeshMaterial3d(debug_material.clone()),
-            Transform::default()
-                .with_scale(Vec3::splat(0.2))
-                .with_rotation(Quat::from_rotation_y(PI))
-                .with_translation(Vec3::new(x as f32 / 2.0, 0.0, 0.3)),
-        ));
     }
 
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(10.0, 10.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(20.0, 20.0))),
         MeshMaterial3d(standard_materials.add(StandardMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: 1.0,
