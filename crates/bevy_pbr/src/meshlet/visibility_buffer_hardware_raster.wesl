@@ -8,6 +8,7 @@ import package::{
         meshlet_instance_uniforms,
         meshlet_raster_clusters,
         meshlet_previous_raster_counts,
+        meshlet_depth_buffer,
         meshlet_visibility_buffer,
         view,
         get_meshlet_triangle_count,
@@ -17,7 +18,10 @@ import package::{
     render::mesh_functions::mesh_position_local_to_world,
 };
 import bevy_render::maths::affine3_to_square;
-var<immediate> meshlet_raster_cluster_rightmost_slot: u32;
+struct HardwareRasterImmediates {
+    meshlet_raster_cluster_rightmost_slot: u32,
+}
+var<immediate> immediates: HardwareRasterImmediates;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -28,7 +32,7 @@ struct VertexOutput {
 @vertex
 fn vertex(@builtin(instance_index) instance_index: u32, @builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let cluster_in_draw = meshlet_previous_raster_counts[1] + instance_index;
-    let cluster_id = meshlet_raster_cluster_rightmost_slot - cluster_in_draw;
+    let cluster_id = immediates.meshlet_raster_cluster_rightmost_slot - cluster_in_draw;
     let instanced_offset = meshlet_raster_clusters[cluster_id];
     var meshlet = meshlets[instanced_offset.offset];
 
@@ -58,11 +62,16 @@ fn vertex(@builtin(instance_index) instance_index: u32, @builtin(vertex_index) v
 @fragment
 fn fragment(vertex_output: VertexOutput) {
     let depth = bitcast<u32>(vertex_output.position.z);
-    @if(MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT)
-    let visibility = (u64(depth) << 32u) | u64(vertex_output.packed_ids);
-    @else
-    let visibility = depth;
-    textureAtomicMax(meshlet_visibility_buffer, vec2<u32>(vertex_output.position.xy), visibility);
+    let frag_coord_1d = u32(vertex_output.position.y) * u32(view.viewport.z) + u32(vertex_output.position.x);
+    @if(MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT) {
+        let prev = atomicMax(&meshlet_depth_buffer[frag_coord_1d], depth);
+        if depth >= prev {
+            atomicExchange(&meshlet_visibility_buffer[frag_coord_1d], vertex_output.packed_ids);
+        }
+    }
+    @else {
+        atomicMax(&meshlet_depth_buffer[frag_coord_1d], depth);
+    }
 }
 
 fn dummy_vertex() -> VertexOutput {

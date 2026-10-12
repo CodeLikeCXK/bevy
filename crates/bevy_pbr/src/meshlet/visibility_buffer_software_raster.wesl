@@ -9,6 +9,7 @@ import package::{
         meshlet_raster_clusters,
         meshlet_previous_raster_counts,
         meshlet_software_raster_cluster_count,
+        meshlet_depth_buffer,
         meshlet_visibility_buffer,
         view,
         get_meshlet_vertex_count,
@@ -108,7 +109,7 @@ fn rasterize_cluster(
     var z_row = dot(vertices_z, w_row);
 
     // Rasterize triangle
-    if subgroupAny(max_x - min_x > 4.0) {
+    if max_x - min_x > 4.0 {
         // Scanline setup
         let edge_012 = -w_x;
         let open_edge = edge_012 < vec3(0.0);
@@ -169,11 +170,16 @@ fn rasterize_cluster(
 
 fn write_visibility_buffer_pixel(x: f32, y: f32, z: f32, packed_ids: u32) {
     let depth = bitcast<u32>(z);
-    @if(MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT)
-    let visibility = (u64(depth) << 32u) | u64(packed_ids);
-    @else
-    let visibility = depth;
-    textureAtomicMax(meshlet_visibility_buffer, vec2(u32(x), u32(y)), visibility);
+    let frag_coord_1d = u32(y) * u32(view.viewport.z) + u32(x);
+    @if(MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT) {
+        let prev = atomicMax(&meshlet_depth_buffer[frag_coord_1d], depth);
+        if depth >= prev {
+            atomicExchange(&meshlet_visibility_buffer[frag_coord_1d], packed_ids);
+        }
+    }
+    @else {
+        atomicMax(&meshlet_depth_buffer[frag_coord_1d], depth);
+    }
 }
 
 fn edge_function(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> f32 {

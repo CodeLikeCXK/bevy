@@ -476,7 +476,7 @@ impl SpecializedComputePipeline for DownsampleDepthPipeline {
         ComputePipelineDescriptor {
             label: Some(label),
             layout: vec![self.bind_group_layout.clone()],
-            immediate_size: 4,
+            immediate_size: 12,
             shader: self.shader.clone(),
             shader_defs,
             entry_point: Some(if key.contains(DownsampleDepthPipelineKey::SECOND_PHASE) {
@@ -683,8 +683,11 @@ impl ViewDepthPyramid {
             timestamp_writes: None,
         });
         downsample_pass.set_pipeline(downsample_depth_first_pipeline);
-        // Pass the mip count as an immediate, for simplicity.
-        downsample_pass.set_immediates(0, &self.mip_count.to_le_bytes());
+        let mut immediates = [0u8; 12];
+        immediates[0..4].copy_from_slice(&self.mip_count.to_le_bytes());
+        immediates[4..8].copy_from_slice(&view_size.x.to_le_bytes());
+        immediates[8..12].copy_from_slice(&view_size.y.to_le_bytes());
+        downsample_pass.set_immediates(0, &immediates);
         downsample_pass.set_bind_group(0, downsample_depth_bind_group, &[]);
         downsample_pass.dispatch_workgroups(
             virtual_view_size.x.div_ceil(64),

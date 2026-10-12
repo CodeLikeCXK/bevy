@@ -570,19 +570,11 @@ fn insert_future_resources(render_creation: &RenderCreation, main_world: &mut Wo
 ///
 /// This lets us work around hardware bugs.
 pub fn get_adreno_model(adapter_info: &RenderAdapterInfo) -> Option<u32> {
-    if !cfg!(target_os = "android") {
-        return None;
-    }
-
-    let adreno_model = adapter_info.name.strip_prefix("Adreno (TM) ")?;
-
-    // Take suffixes into account (like Adreno 642L).
-    Some(
-        adreno_model
-            .chars()
-            .map_while(|c| c.to_digit(10))
-            .fold(0, |acc, digit| acc * 10 + digit),
-    )
+    let name = &adapter_info.name;
+    let idx = name.find("Adreno")?;
+    let rest = &name[idx + "Adreno".len()..];
+    let digits: String = rest.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// Get the Mali driver version if the adapter is a Mali GPU.

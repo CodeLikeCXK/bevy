@@ -71,11 +71,7 @@ fn cull_clusters(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
         near = projection[3][2];
     }
     var screen_aabb = ScreenAabb(vec3<f32>(0.0), vec3<f32>(0.0));
-    var sw_raster = project_aabb(clip_from_local, near, aabb, &screen_aabb);
-    if sw_raster {
-        let aabb_size = (screen_aabb.max.xy - screen_aabb.min.xy) * view.viewport.zw;
-        sw_raster = all(aabb_size <= vec2<f32>(64.0));
-    }
+    var sw_raster = false;
 
     var buffer_slot: u32;
     if sw_raster {

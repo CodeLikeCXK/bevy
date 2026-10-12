@@ -136,16 +136,19 @@ impl ResourceManager {
             // TODO: Buffer min sizes
             clear_visibility_buffer_bind_group_layout: BindGroupLayoutDescriptor::new(
                 "meshlet_clear_visibility_buffer_bind_group_layout",
-                &BindGroupLayoutEntries::single(
+                &BindGroupLayoutEntries::sequential(
                     ShaderStages::COMPUTE,
-                    texture_storage_2d(TextureFormat::R64Uint, StorageTextureAccess::WriteOnly),
+                    (
+                        storage_buffer_sized(false, None),
+                        storage_buffer_sized(false, None),
+                    ),
                 ),
             ),
             clear_visibility_buffer_shadow_view_bind_group_layout: BindGroupLayoutDescriptor::new(
                 "meshlet_clear_visibility_buffer_shadow_view_bind_group_layout",
                 &BindGroupLayoutEntries::single(
                     ShaderStages::COMPUTE,
-                    texture_storage_2d(TextureFormat::R32Uint, StorageTextureAccess::WriteOnly),
+                    storage_buffer_sized(false, None),
                 ),
             ),
             first_instance_cull_bind_group_layout: BindGroupLayoutDescriptor::new(
@@ -283,7 +286,7 @@ impl ResourceManager {
                         texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly)
                     };
                     (
-                        texture_storage_2d(TextureFormat::R64Uint, StorageTextureAccess::ReadOnly),
+                        storage_buffer_read_only_sized(false, None),
                         write_only_r32float(),
                         write_only_r32float(),
                         write_only_r32float(),
@@ -310,7 +313,7 @@ impl ResourceManager {
                         texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly)
                     };
                     (
-                        texture_storage_2d(TextureFormat::R32Uint, StorageTextureAccess::ReadOnly),
+                        storage_buffer_read_only_sized(false, None),
                         write_only_r32float(),
                         write_only_r32float(),
                         write_only_r32float(),
@@ -342,8 +345,9 @@ impl ResourceManager {
                         storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
-                        texture_storage_2d(TextureFormat::R64Uint, StorageTextureAccess::Atomic),
+                        storage_buffer_sized(false, None),
                         uniform_buffer::<ViewUniform>(true),
+                        storage_buffer_sized(false, None),
                     ),
                 ),
             ),
@@ -359,7 +363,7 @@ impl ResourceManager {
                         storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
-                        texture_storage_2d(TextureFormat::R32Uint, StorageTextureAccess::Atomic),
+                        storage_buffer_sized(false, None),
                         uniform_buffer::<ViewUniform>(true),
                     ),
                 ),
@@ -368,14 +372,14 @@ impl ResourceManager {
                 "meshlet_resolve_depth_bind_group_layout",
                 &BindGroupLayoutEntries::single(
                     ShaderStages::FRAGMENT,
-                    texture_storage_2d(TextureFormat::R64Uint, StorageTextureAccess::ReadOnly),
+                    storage_buffer_read_only_sized(false, None),
                 ),
             ),
             resolve_depth_shadow_view_bind_group_layout: BindGroupLayoutDescriptor::new(
                 "meshlet_resolve_depth_shadow_view_bind_group_layout",
                 &BindGroupLayoutEntries::single(
                     ShaderStages::FRAGMENT,
-                    texture_storage_2d(TextureFormat::R32Uint, StorageTextureAccess::ReadOnly),
+                    storage_buffer_read_only_sized(false, None),
                 ),
             ),
             resolve_material_depth_bind_group_layout: BindGroupLayoutDescriptor::new(
@@ -383,7 +387,8 @@ impl ResourceManager {
                 &BindGroupLayoutEntries::sequential(
                     ShaderStages::FRAGMENT,
                     (
-                        texture_storage_2d(TextureFormat::R64Uint, StorageTextureAccess::ReadOnly),
+                        storage_buffer_read_only_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
                     ),
@@ -394,7 +399,7 @@ impl ResourceManager {
                 &BindGroupLayoutEntries::sequential(
                     ShaderStages::FRAGMENT,
                     (
-                        texture_storage_2d(TextureFormat::R64Uint, StorageTextureAccess::ReadOnly),
+                        storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
@@ -456,7 +461,8 @@ pub struct MeshletViewResources {
     pub max_bvh_depth: u32,
     instance_visibility: Buffer,
     pub dummy_render_target: CachedTexture,
-    pub visibility_buffer: CachedTexture,
+    pub visibility_buffer: Buffer,
+    pub depth_buffer: Buffer,
     pub second_pass_count: Buffer,
     pub second_pass_dispatch: Buffer,
     pub second_pass_candidates: Buffer,
@@ -602,23 +608,20 @@ pub fn prepare_meshlet_per_frame_resources(
             },
         );
 
-        let visibility_buffer = texture_cache.get(
-            &render_device,
-            TextureDescriptor {
-                label: Some("meshlet_visibility_buffer"),
-                size: view.viewport.zw().to_extents(),
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: if not_shadow_view {
-                    TextureFormat::R64Uint
-                } else {
-                    TextureFormat::R32Uint
-                },
-                usage: TextureUsages::STORAGE_ATOMIC | TextureUsages::STORAGE_BINDING,
-                view_formats: &[],
-            },
-        );
+        let buffer_size = (view.viewport.z * view.viewport.w) as u64 * 4;
+        let visibility_buffer = render_device.create_buffer(&BufferDescriptor {
+            label: Some("meshlet_visibility_buffer"),
+            size: buffer_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let depth_buffer = render_device.create_buffer(&BufferDescriptor {
+            label: Some("meshlet_depth_buffer"),
+            size: buffer_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let second_pass_count = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("meshlet_second_pass_count"),
@@ -762,6 +765,7 @@ pub fn prepare_meshlet_per_frame_resources(
             instance_visibility,
             dummy_render_target,
             visibility_buffer,
+            depth_buffer,
             second_pass_count,
             second_pass_dispatch,
             second_pass_candidates: second_pass_candidates.clone(),
@@ -812,15 +816,26 @@ pub fn prepare_meshlet_view_bind_groups(
 
     // TODO: Some of these bind groups can be reused across multiple views
     for (view_entity, view_resources) in &views {
-        let clear_visibility_buffer = render_device.create_bind_group(
-            "meshlet_clear_visibility_buffer_bind_group",
-            &pipeline_cache.get_bind_group_layout(if view_resources.not_shadow_view {
-                &resource_manager.clear_visibility_buffer_bind_group_layout
-            } else {
-                &resource_manager.clear_visibility_buffer_shadow_view_bind_group_layout
-            }),
-            &BindGroupEntries::single(&view_resources.visibility_buffer.default_view),
-        );
+        let clear_visibility_buffer = if view_resources.not_shadow_view {
+            render_device.create_bind_group(
+                "meshlet_clear_visibility_buffer_bind_group",
+                &pipeline_cache.get_bind_group_layout(
+                    &resource_manager.clear_visibility_buffer_bind_group_layout,
+                ),
+                &BindGroupEntries::sequential((
+                    view_resources.depth_buffer.as_entire_binding(),
+                    view_resources.visibility_buffer.as_entire_binding(),
+                )),
+            )
+        } else {
+            render_device.create_bind_group(
+                "meshlet_clear_visibility_buffer_shadow_view_bind_group_layout",
+                &pipeline_cache.get_bind_group_layout(
+                    &resource_manager.clear_visibility_buffer_shadow_view_bind_group_layout,
+                ),
+                &BindGroupEntries::single(view_resources.depth_buffer.as_entire_binding()),
+            )
+        };
 
         let first_instance_cull = render_device.create_bind_group(
             "meshlet_first_instance_cull_bind_group",
@@ -1075,35 +1090,60 @@ pub fn prepare_meshlet_view_bind_groups(
             } else {
                 &resource_manager.downsample_depth_shadow_view_bind_group_layout
             }),
-            &view_resources.visibility_buffer.default_view,
+            view_resources.depth_buffer.as_entire_binding(),
             &resource_manager.depth_pyramid_sampler,
         );
 
-        let visibility_buffer_raster = render_device.create_bind_group(
-            "meshlet_visibility_raster_buffer_bind_group",
-            &pipeline_cache.get_bind_group_layout(if view_resources.not_shadow_view {
-                &resource_manager.visibility_buffer_raster_bind_group_layout
-            } else {
-                &resource_manager.visibility_buffer_raster_shadow_view_bind_group_layout
-            }),
-            &BindGroupEntries::sequential((
-                resource_manager
-                    .visibility_buffer_raster_clusters
-                    .as_entire_binding(),
-                meshlet_mesh_manager.meshlets.binding(),
-                meshlet_mesh_manager.indices.binding(),
-                meshlet_mesh_manager.vertex_positions.binding(),
-                instance_manager.instance_uniforms.binding().unwrap(),
-                resource_manager
-                    .visibility_buffer_raster_cluster_prev_counts
-                    .as_entire_binding(),
-                resource_manager
-                    .software_raster_cluster_count
-                    .as_entire_binding(),
-                &view_resources.visibility_buffer.default_view,
-                view_uniforms.clone(),
-            )),
-        );
+        let visibility_buffer_raster = if view_resources.not_shadow_view {
+            render_device.create_bind_group(
+                "meshlet_visibility_raster_buffer_bind_group",
+                &pipeline_cache.get_bind_group_layout(
+                    &resource_manager.visibility_buffer_raster_bind_group_layout,
+                ),
+                &BindGroupEntries::sequential((
+                    resource_manager
+                        .visibility_buffer_raster_clusters
+                        .as_entire_binding(),
+                    meshlet_mesh_manager.meshlets.binding(),
+                    meshlet_mesh_manager.indices.binding(),
+                    meshlet_mesh_manager.vertex_positions.binding(),
+                    instance_manager.instance_uniforms.binding().unwrap(),
+                    resource_manager
+                        .visibility_buffer_raster_cluster_prev_counts
+                        .as_entire_binding(),
+                    resource_manager
+                        .software_raster_cluster_count
+                        .as_entire_binding(),
+                    view_resources.depth_buffer.as_entire_binding(),
+                    view_uniforms.clone(),
+                    view_resources.visibility_buffer.as_entire_binding(),
+                )),
+            )
+        } else {
+            render_device.create_bind_group(
+                "meshlet_visibility_raster_buffer_shadow_view_bind_group_layout",
+                &pipeline_cache.get_bind_group_layout(
+                    &resource_manager.visibility_buffer_raster_shadow_view_bind_group_layout,
+                ),
+                &BindGroupEntries::sequential((
+                    resource_manager
+                        .visibility_buffer_raster_clusters
+                        .as_entire_binding(),
+                    meshlet_mesh_manager.meshlets.binding(),
+                    meshlet_mesh_manager.indices.binding(),
+                    meshlet_mesh_manager.vertex_positions.binding(),
+                    instance_manager.instance_uniforms.binding().unwrap(),
+                    resource_manager
+                        .visibility_buffer_raster_cluster_prev_counts
+                        .as_entire_binding(),
+                    resource_manager
+                        .software_raster_cluster_count
+                        .as_entire_binding(),
+                    view_resources.depth_buffer.as_entire_binding(),
+                    view_uniforms.clone(),
+                )),
+            )
+        };
 
         let resolve_depth = render_device.create_bind_group(
             "meshlet_resolve_depth_bind_group",
@@ -1112,7 +1152,7 @@ pub fn prepare_meshlet_view_bind_groups(
             } else {
                 &resource_manager.resolve_depth_shadow_view_bind_group_layout
             }),
-            &BindGroupEntries::single(&view_resources.visibility_buffer.default_view),
+            &BindGroupEntries::single(view_resources.depth_buffer.as_entire_binding()),
         );
 
         let resolve_material_depth = view_resources.material_depth.as_ref().map(|_| {
@@ -1122,11 +1162,12 @@ pub fn prepare_meshlet_view_bind_groups(
                     &resource_manager.resolve_material_depth_bind_group_layout,
                 ),
                 &BindGroupEntries::sequential((
-                    &view_resources.visibility_buffer.default_view,
+                    view_resources.depth_buffer.as_entire_binding(),
                     resource_manager
                         .visibility_buffer_raster_clusters
                         .as_entire_binding(),
                     instance_manager.instance_material_ids.binding().unwrap(),
+                    view_resources.visibility_buffer.as_entire_binding(),
                 )),
             )
         });
@@ -1137,7 +1178,7 @@ pub fn prepare_meshlet_view_bind_groups(
                 &pipeline_cache
                     .get_bind_group_layout(&resource_manager.material_shade_bind_group_layout),
                 &BindGroupEntries::sequential((
-                    &view_resources.visibility_buffer.default_view,
+                    view_resources.visibility_buffer.as_entire_binding(),
                     resource_manager
                         .visibility_buffer_raster_clusters
                         .as_entire_binding(),

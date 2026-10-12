@@ -171,6 +171,7 @@ pub fn meshlet_visibility_buffer_raster(
         meshlet_view_bind_groups,
         resolve_depth_pipeline,
         camera,
+        meshlet_view_resources.view_size,
     );
     resolve_material_depth(
         &mut ctx,
@@ -296,6 +297,7 @@ pub fn meshlet_visibility_buffer_raster(
             meshlet_view_bind_groups,
             resolve_depth_shadow_view_pipeline,
             camera,
+            meshlet_view_resources.view_size,
         );
         meshlet_view_resources
             .depth_pyramid
@@ -609,6 +611,7 @@ fn resolve_depth(
     meshlet_view_bind_groups: &MeshletViewBindGroups,
     resolve_depth_pipeline: &RenderPipeline,
     camera: &ExtractedCamera,
+    view_size: UVec2,
 ) {
     let mut resolve_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("resolve_depth"),
@@ -622,6 +625,7 @@ fn resolve_depth(
         resolve_pass.set_camera_viewport(viewport);
     }
     resolve_pass.set_render_pipeline(resolve_depth_pipeline);
+    resolve_pass.set_immediates(0, bytemuck::bytes_of(&view_size.x));
     resolve_pass.set_bind_group(0, &meshlet_view_bind_groups.resolve_depth, &[]);
     resolve_pass.draw(0..3, 0..1);
 }
@@ -656,6 +660,7 @@ fn resolve_material_depth(
             resolve_pass.set_camera_viewport(viewport);
         }
         resolve_pass.set_render_pipeline(resolve_material_depth_pipeline);
+        resolve_pass.set_immediates(0, bytemuck::bytes_of(&meshlet_view_resources.view_size.x));
         resolve_pass.set_bind_group(0, resolve_material_depth_bind_group, &[]);
         resolve_pass.draw(0..3, 0..1);
     }

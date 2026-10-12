@@ -4,10 +4,15 @@
 
 use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     pbr::experimental::meshlet::{MeshletMesh3d, MeshletPlugin},
     prelude::*,
-    render::render_resource::AsBindGroup,
+    render::{
+        render_resource::AsBindGroup,
+        settings::{Backends, Dx12Compiler, WgpuSettings},
+        RenderPlugin,
+    },
 };
 use std::f32::consts::PI;
 
@@ -16,14 +21,26 @@ const ASSET_URL: &str =
 
 fn main() {
     App::new()
-        .insert_resource(DirectionalLightShadowMap { size: 4096 })
+        .insert_resource(DirectionalLightShadowMap { size: 1024 })
         .add_plugins((
-            DefaultPlugins,
+            DefaultPlugins.set(RenderPlugin {
+                render_creation: WgpuSettings {
+                    backends: Some(Backends::DX12),
+                    dx12_shader_compiler: Dx12Compiler::DynamicDxc {
+                        dxc_path: "dxcompiler.dll".to_string(),
+                    },
+                    ..default()
+                }
+                .into(),
+                ..default()
+            }),
             MeshletPlugin {
                 cluster_buffer_slots: 1 << 14,
             },
             MaterialPlugin::<MeshletDebugMaterial>::default(),
             FreeCameraPlugin,
+            FrameTimeDiagnosticsPlugin::default(),
+            LogDiagnosticsPlugin::default(),
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, bunny_wiggler)
@@ -107,7 +124,7 @@ fn setup(
     }
 
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(5.0, 5.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(10.0, 10.0))),
         MeshMaterial3d(standard_materials.add(StandardMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: 1.0,

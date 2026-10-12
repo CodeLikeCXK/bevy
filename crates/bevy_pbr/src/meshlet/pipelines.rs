@@ -211,7 +211,7 @@ pub fn init_meshlet_pipelines(
         downsample_depth_first: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_downsample_depth_first_pipeline".into()),
             layout: vec![downsample_depth_layout.clone()],
-            immediate_size: 4,
+            immediate_size: 12,
             shader: downsample_depth_shader.clone(),
             shader_defs: vec![
                 "MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT".into(),
@@ -224,7 +224,7 @@ pub fn init_meshlet_pipelines(
         downsample_depth_second: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_downsample_depth_second_pipeline".into()),
             layout: vec![downsample_depth_layout.clone()],
-            immediate_size: 4,
+            immediate_size: 12,
             shader: downsample_depth_shader.clone(),
             shader_defs: vec![
                 "MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT".into(),
@@ -238,7 +238,7 @@ pub fn init_meshlet_pipelines(
             ComputePipelineDescriptor {
                 label: Some("meshlet_downsample_depth_first_pipeline".into()),
                 layout: vec![downsample_depth_shadow_view_layout.clone()],
-                immediate_size: 4,
+                immediate_size: 12,
                 shader: downsample_depth_shader.clone(),
                 shader_defs: vec!["MESHLET".into()],
                 entry_point: Some("downsample_depth_first".into()),
@@ -250,7 +250,7 @@ pub fn init_meshlet_pipelines(
             ComputePipelineDescriptor {
                 label: Some("meshlet_downsample_depth_second_pipeline".into()),
                 layout: vec![downsample_depth_shadow_view_layout],
-                immediate_size: 4,
+                immediate_size: 12,
                 shader: downsample_depth_shader,
                 shader_defs: vec!["MESHLET".into()],
                 entry_point: Some("downsample_depth_second".into()),
@@ -385,6 +385,7 @@ pub fn init_meshlet_pipelines(
         resolve_depth: pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
             label: Some("meshlet_resolve_depth_pipeline".into()),
             layout: vec![resolve_depth_layout],
+            immediate_size: 4,
             vertex: vertex_state.clone(),
             depth_stencil: Some(DepthStencilState {
                 format: CORE_3D_DEPTH_FORMAT,
@@ -405,6 +406,7 @@ pub fn init_meshlet_pipelines(
         resolve_depth_shadow_view: pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
             label: Some("meshlet_resolve_depth_pipeline".into()),
             layout: vec![resolve_depth_shadow_view_layout],
+            immediate_size: 4,
             vertex: vertex_state.clone(),
             depth_stencil: Some(DepthStencilState {
                 format: CORE_3D_SHADOW_MAP_FORMAT,
@@ -424,6 +426,7 @@ pub fn init_meshlet_pipelines(
         resolve_material_depth: pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
             label: Some("meshlet_resolve_material_depth_pipeline".into()),
             layout: vec![resolve_material_depth_layout],
+            immediate_size: 4,
             vertex: vertex_state,
             primitive: PrimitiveState::default(),
             depth_stencil: Some(DepthStencilState {

@@ -118,10 +118,7 @@ pub struct MeshletPlugin {
 impl MeshletPlugin {
     /// [`WgpuFeatures`] required for this plugin to function.
     pub fn required_wgpu_features() -> WgpuFeatures {
-        WgpuFeatures::TEXTURE_INT64_ATOMIC
-            | WgpuFeatures::TEXTURE_ATOMIC
-            | WgpuFeatures::SHADER_INT64
-            | WgpuFeatures::SUBGROUP
+        WgpuFeatures::SUBGROUP
             | WgpuFeatures::DEPTH_CLIP_CONTROL
             | WgpuFeatures::IMMEDIATES
     }
