@@ -1,0 +1,17 @@
+[package]
+name = "makemeshlet"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone CLI tool to preprocess GLTF meshes into Bevy MeshletMesh assets"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bevy_mesh = { path = "../../crates/bevy_mesh" }
+bevy_pbr = { path = "../../crates/bevy_pbr", features = ["meshlet", "meshlet_processor"] }
+bevy_asset = { path = "../../crates/bevy_asset" }
+bevy_math = { path = "../../crates/bevy_math" }
+bevy_tasks = { path = "../../crates/bevy_tasks" }
+gltf = { version = "1.4.0", default-features = false, features = ["names", "utils", "import"] }
+clap = { version = "4.0", features = ["derive"] }
+futures-io = { version = "0.3", default-features = false }
