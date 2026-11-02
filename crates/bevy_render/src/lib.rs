@@ -571,6 +571,14 @@ fn insert_future_resources(render_creation: &RenderCreation, main_world: &mut Wo
 /// This lets us work around hardware bugs.
 pub fn get_adreno_model(adapter_info: &RenderAdapterInfo) -> Option<u32> {
     let name = &adapter_info.name;
+    
+    // 优先识别 Windows on ARM 骁龙平台 (8cx Gen 3 内置 Adreno 690)
+    if name.contains("8cx") {
+        return Some(690);
+    }
+    if name.contains("Snapdragon") || name.contains("X Elite") {
+        return Some(790); // 对应新一代高端 Adreno
+    }
     let idx = name.find("Adreno")?;
     let rest = &name[idx + "Adreno".len()..];
     let digits: String = rest.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
