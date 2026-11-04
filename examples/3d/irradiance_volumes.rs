@@ -23,6 +23,7 @@ use bevy::{
     render::render_resource::{AsBindGroup, ShaderType},
     shader::ShaderRef,
     window::PrimaryWindow,
+    world_serialization::WorldInstanceReady,
 };
 
 /// This example uses a shader source file from the assets subdirectory
@@ -220,7 +221,6 @@ fn setup(mut commands: Commands, assets: Res<ExampleAssets>, app_status: Res<App
     spawn_main_scene(&mut commands, &assets);
     spawn_camera(&mut commands, &assets);
     spawn_irradiance_volume(&mut commands, &assets);
-    spawn_light(&mut commands);
     spawn_sphere(&mut commands, &assets);
     spawn_voxel_cube_parent(&mut commands);
     spawn_fox(&mut commands, &assets);
@@ -228,7 +228,9 @@ fn setup(mut commands: Commands, assets: Res<ExampleAssets>, app_status: Res<App
 }
 
 fn spawn_main_scene(commands: &mut Commands, assets: &ExampleAssets) {
-    commands.spawn(WorldAssetRoot(assets.main_scene.clone()));
+    commands
+        .spawn(WorldAssetRoot(assets.main_scene.clone()))
+        .observe(setup_scene_lights);
 }
 
 fn spawn_camera(commands: &mut Commands, assets: &ExampleAssets) {
@@ -254,7 +256,40 @@ fn spawn_irradiance_volume(commands: &mut Commands, assets: &ExampleAssets) {
     ));
 }
 
-fn spawn_light(commands: &mut Commands) {
+fn setup_scene_lights(
+    scene_ready: On<WorldInstanceReady>,
+    mut commands: Commands,
+    children: Query<&Children>,
+    mut point_lights: Query<&mut PointLight>,
+    mut directional_lights: Query<&mut DirectionalLight>,
+    mut spot_lights: Query<&mut SpotLight>,
+) {
+    let mut light_count = 0;
+
+    for descendant in children.iter_descendants(scene_ready.entity) {
+        if let Ok(mut point_light) = point_lights.get_mut(descendant) {
+            light_count += 1;
+            point_light.shadow_maps_enabled = true;
+        }
+        if let Ok(mut directional_light) = directional_lights.get_mut(descendant) {
+            light_count += 1;
+            directional_light.shadow_maps_enabled = true;
+        }
+        if let Ok(mut spot_light) = spot_lights.get_mut(descendant) {
+            light_count += 1;
+            spot_light.shadow_maps_enabled = true;
+        }
+    }
+
+    if light_count == 0 {
+        info!("GLB scene has no lights, spawning fallback point light");
+        spawn_fallback_light(&mut commands);
+    } else {
+        info!("Found {light_count} light(s) in GLB scene, shadows enabled");
+    }
+}
+
+fn spawn_fallback_light(commands: &mut Commands) {
     commands.spawn((
         PointLight {
             intensity: 250000.0,
@@ -497,9 +532,9 @@ impl FromWorld for ExampleAssets {
             main_sphere_material: world.add_asset(Color::from(SILVER)),
             main_scene: world.load_asset(
                 GltfAssetLabel::Scene(0)
-                    .from_asset("models/IrradianceVolumeExample/IrradianceVolumeExample.glb"),
+                    .from_asset("models/IrradianceVolumeExample/Scene_test.glb"),
             ),
-            irradiance_volume: world.load_asset("irradiance_volumes/Example.vxgi.ktx2"),
+            irradiance_volume: world.load_asset("irradiance_volumes/Scene_test_Irradiance_Info.ktx2"),
             fox_animation_graph: world.add_asset(fox_animation_graph),
             fox_animation_node,
             voxel_cube: world.add_asset(Cuboid::default()),
