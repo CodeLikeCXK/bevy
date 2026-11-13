@@ -32,11 +32,6 @@ use thiserror::Error;
 /// This example uses a shader source file from the assets subdirectory
 const SHADER_ASSET_PATH: &str = "shaders/irradiance_volume_voxel_visualization.wesl";
 
-/// The baked irradiance volume texture. Its `.meta.json` sidecar is loaded
-/// automatically to position and scale the volume.
-const IRRADIANCE_VOLUME_ASSET: &str =
-    "irradiance_volumes/lego_technic_bugatti_chiron_lighted_Irradiance_Info.ktx2";
-
 // Rotation speed in radians per frame.
 const ROTATION_SPEED: f32 = 0.2;
 
@@ -625,23 +620,28 @@ fn handle_mouse_clicks(
 
 impl FromWorld for ExampleAssets {
     fn from_world(world: &mut World) -> Self {
-        let fox_animation =
-            world.load_asset(GltfAssetLabel::Animation(1).from_asset("models/animated/Fox.glb"));
+        // Asset paths.
+        let fox_asset = "models/animated/Fox.glb";
+        let scene_asset = "models/IrradianceVolumeExample/Scene_test.glb";
+        // The baked irradiance volume texture. Its `.meta.json` sidecar is
+        // loaded automatically to position and scale the volume.
+        let irradiance_volume_asset =
+            "irradiance_volumes/Scene_test_Irradiance_Info.ktx2";
+
+        let fox_animation = world.load_asset(GltfAssetLabel::Animation(1).from_asset(fox_asset));
         let (fox_animation_graph, fox_animation_node) =
             AnimationGraph::from_clip(fox_animation.clone());
 
-        let irradiance_volume = world.load_asset::<Image>(IRRADIANCE_VOLUME_ASSET);
-        let irradiance_volume_meta = world.load_asset::<IrradianceVolumeMeta>(
-            IRRADIANCE_VOLUME_ASSET.replace(".ktx2", ".meta.json"),
-        );
+        let irradiance_volume_meta_asset = irradiance_volume_asset.replace(".ktx2", ".meta.json");
+        let irradiance_volume = world.load_asset::<Image>(irradiance_volume_asset);
+        let irradiance_volume_meta =
+            world.load_asset::<IrradianceVolumeMeta>(irradiance_volume_meta_asset);
 
         ExampleAssets {
             main_sphere: world.add_asset(Sphere::default().mesh().uv(32, 18)),
-            fox: world.load_asset(GltfAssetLabel::Scene(0).from_asset("models/animated/Fox.glb")),
+            fox: world.load_asset(GltfAssetLabel::Scene(0).from_asset(fox_asset)),
             main_sphere_material: world.add_asset(Color::from(SILVER)),
-            main_scene: world.load_asset(GltfAssetLabel::Scene(0).from_asset(
-                "models/IrradianceVolumeExample/Scene_test.glb",
-            )),
+            main_scene: world.load_asset(GltfAssetLabel::Scene(0).from_asset(scene_asset)),
             irradiance_volume,
             irradiance_volume_meta,
             fox_animation_graph: world.add_asset(fox_animation_graph),
@@ -650,7 +650,7 @@ impl FromWorld for ExampleAssets {
             // Just use a specular map for the skybox since it's not too blurry.
             // In reality you wouldn't do this--you'd use a real skybox texture--but
             // reusing the textures like this saves space in the Bevy repository.
-            skybox: world.load_asset("environment_maps/Scene_test_Irradiance_Info.ktx2"),
+            skybox: world.load_asset("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
         }
     }
 }
