@@ -1686,6 +1686,7 @@ wasm = false
 name = "irradiance_volumes"
 path = "examples/3d/irradiance_volumes.rs"
 doc-scrape-examples = true
+required-features = ["jpeg"]
 
 [package.metadata.example.irradiance_volumes]
 name = "Irradiance Volumes"
@@ -5812,3 +5813,10 @@ bevy_pbr = { path = "crates/bevy_pbr" }
 bevy_core_pipeline = { path = "crates/bevy_core_pipeline" }
 bevy_sprite_render = { path = "crates/bevy_sprite_render" }
 bevy_ui_render = { path = "crates/bevy_ui_render" }
+
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+neon,+fp16,+dotprod"]
+[profile.release]
+lto = "thin"
+codegen-units = 1

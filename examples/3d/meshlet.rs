@@ -16,9 +16,10 @@ use bevy::{
 };
 use std::f32::consts::PI;
 
-const ASSET_URL: &str =
-    "https://github.com/bevyengine/bevy_asset_files/raw/6dccaef517bde74d1969734703709aead7211dbc/meshlet/bunny.meshlet_mesh";
 
+
+const ASSET_URL: &str =
+    "models/Military_Trenches_Tunnel.meshlet_mesh";
 fn main() {
     App::new()
         .insert_resource(DirectionalLightShadowMap { size: 1024 })
@@ -54,6 +55,51 @@ fn setup(
     mut debug_materials: ResMut<Assets<MeshletDebugMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    //add texture loading
+use bevy::image::ImageLoaderSettings;
+
+// 1. 加载固有色贴图 (sRGB)
+let albedo_texture = asset_server.load("textures/bunker/albedo.jpeg");
+
+// 2. 加载法线贴图 (必须为线性颜色空间 Linear, is_srgb = false)
+let normal_texture = asset_server
+    .load_builder()
+    .with_settings(|settings: &mut ImageLoaderSettings| {
+        settings.is_srgb = false;
+    })
+    .load("textures/bunker/normal.jpeg");
+
+// 3. 加载 ORM 贴图 (线性空间 Linear, is_srgb = false)
+let orm_texture = asset_server
+    .load_builder()
+    .with_settings(|settings: &mut ImageLoaderSettings| {
+        settings.is_srgb = false;
+    })
+    .load("textures/bunker/orm.jpeg");
+
+// 4. 构建 Bunker PBR 材质
+let bunker_material = standard_materials.add(StandardMaterial {
+    base_color: Color::WHITE,
+    base_color_texture: Some(albedo_texture),
+
+    normal_map_texture: Some(normal_texture),
+
+    // ORM 贴图同时作为金属/粗糙度贴图与环境遮蔽贴图
+    metallic_roughness_texture: Some(orm_texture.clone()),
+    occlusion_texture: Some(orm_texture),
+
+    // 关键：将因子设为 1.0，完全由贴图像素决定金属度与粗糙度
+    metallic: 1.0,
+    perceptual_roughness: 1.0,
+
+    // 隧道为内凹中空结构，开启双面渲染可以看到内外两侧钢板
+    double_sided: true,
+    cull_mode: None,
+
+    ..default()
+});
+ //texture loading end
+
     commands.spawn((
         Camera3d::default(),
         Transform::from_translation(Vec3::new(3.5, 2.5, 4.0)).looking_at(Vec3::ZERO, Vec3::Y),
@@ -90,10 +136,10 @@ fn setup(
     let debug_material = debug_materials.add(MeshletDebugMaterial::default());
 
     // 2D 网格生成：奇数行使用 Debug 材质，偶数行使用色相渐变材质
-    let grid_x = 8; // 每排 9 只 (-4..=4)
-    let grid_z = 8; // 共 9 排 (-4..=4)，总计 81 只高精度兔子
-    let spacing_x = 0.5;
-    let spacing_z = 0.6;
+    let grid_x = 4; // 每排 9 只 (-4..=4)
+    let grid_z = 4; // 共 9 排 (-4..=4)，总计 81 只高精度兔子
+    let spacing_x = 4.0;
+    let spacing_z = 4.0;
 
     for z in -grid_z..=grid_z {
         let is_debug_row = (z + grid_z) % 2 == 1; // 一排渐变色，一排 debug 材质交替
@@ -106,25 +152,22 @@ fn setup(
                     MeshletMesh3d(meshlet_mesh_handle.clone()),
                     MeshMaterial3d(debug_material.clone()),
                     Transform::default()
-                        .with_scale(Vec3::splat(0.2))
+                        .with_scale(Vec3::splat(0.01))
                         .with_rotation(Quat::from_rotation_y(PI))
                         .with_translation(translation),
                 ))
             } else {
                 // 色相渐变排（使用色相环计算平滑彩虹过渡颜色）
+                // 尝试改用标准材质
                 let norm_x = (x + grid_x) as f32 / (2 * grid_x) as f32;
                 let hue = norm_x * 360.0;
-                let color = Hsla::hsl(hue, 0.85, 0.55).into();
+                //let color = Hsla::hsl(hue, 0.85, 0.55).into();
 
                 commands.spawn((
                     MeshletMesh3d(meshlet_mesh_handle.clone()),
-                    MeshMaterial3d(standard_materials.add(StandardMaterial {
-                        base_color: color,
-                        perceptual_roughness: norm_x,
-                        ..default()
-                    })),
+                    MeshMaterial3d(bunker_material.clone()),
                     Transform::default()
-                        .with_scale(Vec3::splat(0.2))
+                        .with_scale(Vec3::splat(0.01))
                         .with_translation(translation),
                 ))
             };
