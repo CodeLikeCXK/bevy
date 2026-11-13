@@ -1,6 +1,6 @@
+mod scene;
+
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bevy_asset::saver::{AssetSaver, SavedAsset};
@@ -10,28 +10,7 @@ use bevy_pbr::experimental::meshlet::{
     MeshletMesh, MeshletMeshSaver, MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
 };
 use clap::Parser;
-
-/// 内存异步写入适配器，实现 futures_io::AsyncWrite
-struct MemoryWriter(Vec<u8>);
-
-impl futures_io::AsyncWrite for MemoryWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.0.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
+use scene::{MemoryWriter, SceneExportOptions};
 
 /// 命令行参数
 #[derive(Parser, Debug)]
@@ -55,6 +34,22 @@ struct Args {
     /// 顶点坐标定点数对齐量化因子 (x 表示 1/2^x 厘米，默认 4 = 1/16 厘米)
     #[arg(short, long, default_value_t = MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR)]
     quantization: u8,
+
+    /// 启用场景模式：遍历节点树变换、按材质合并静态图元、提取灯光与材质并导出 .meshlet_scene.json
+    #[arg(long, default_value_t = false)]
+    scene: bool,
+
+    /// 场景模式下禁用按材质合并（保留各节点独立实例与坐标，仍去重共享同一 Mesh 的资产）
+    #[arg(long, default_value_t = false)]
+    no_merge: bool,
+
+    /// 场景模式下不参与静态合并的节点名称前缀（可多次指定，如 --dynamic-prefix Wheel_）
+    #[arg(long = "dynamic-prefix")]
+    dynamic_prefixes: Vec<String>,
+
+    /// 场景模式下导出 GLB 内嵌/引用贴图到输出目录的 textures/ 子目录
+    #[arg(long, default_value_t = false)]
+    export_textures: bool,
 }
 
 use bevy_tasks::{AsyncComputeTaskPool, TaskPool};
@@ -78,8 +73,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 加载 glTF 文档与缓冲区
     println!("\n[1/4] 正在解析 GLTF 文件...");
     let start_load = Instant::now();
-    let (document, buffers, _images) = gltf::import(&args.input)?;
+    let (document, buffers, images) = gltf::import(&args.input)?;
     println!("      解析完成，耗时 {:.2}ms", start_load.elapsed().as_secs_f64() * 1000.0);
+
+    let input_dir = args.input.parent().unwrap_or_else(|| Path::new("."));
+    let input_stem = args
+        .input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+
+    if args.scene {
+        let out_dir = args.output.clone().unwrap_or_else(|| input_dir.to_path_buf());
+        let options = SceneExportOptions {
+            input: &args.input,
+            out_dir: &out_dir,
+            input_stem,
+            quantization: args.quantization,
+            merge_by_material: !args.no_merge,
+            dynamic_prefixes: &args.dynamic_prefixes,
+            export_textures: args.export_textures,
+        };
+        return scene::run_scene_export(&document, &buffers, &images, &options);
+    }
 
     // 计算总网格与图元数量
     let total_meshes = document.meshes().count();
@@ -88,14 +104,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_primitives += mesh.primitives().count();
     }
     println!("      场景包含 {} 个 Mesh, 共 {} 个 Primitive", total_meshes, total_primitives);
-
-    // 确定输出目录或基础文件名
-    let input_dir = args.input.parent().unwrap_or_else(|| Path::new("."));
-    let input_stem = args
-        .input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
 
     let mut processed_count = 0;
 
