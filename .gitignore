@@ -49,3 +49,12 @@ assets/textures/bunker/orm.jpeg
 assets/textures/bunker/normal.jpeg
 assets/textures/bunker/albedo.jpeg
 assets/models/Military_Trenches_Tunnel.meshlet_mesh
+assets/irradiance_volumes/Scene_test_Irradiance_Info.ktx2
+assets/irradiance_volumes/Scene_test_Irradiance_Info.meta.json
+assets/models/IrradianceVolumeExample/Scene_test.glb
+assets/irradiance_volumes/lego_technic_bugatti_chiron.vxgi.ktx2
+assets/irradiance_volumes/lego_technic_bugatti_chiron.vxgi.meta.json
+assets/models/IrradianceVolumeExample/lego_technic_bugatti_chiron.glb
+assets/models/IrradianceVolumeExample/lego_technic_bugatti_chiron_lighted.glb
+assets/irradiance_volumes/lego_technic_bugatti_chiron_lighted_Irradiance_Info.ktx2
+assets/irradiance_volumes/lego_technic_bugatti_chiron_lighted_Irradiance_Info.meta.json
