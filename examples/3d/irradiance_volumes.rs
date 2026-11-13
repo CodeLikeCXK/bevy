@@ -14,6 +14,7 @@
 //! * Clicking anywhere moves the object.
 
 use bevy::{
+    asset::{io::Reader, AssetLoader, LoadContext},
     color::palettes::css::*,
     light::Skybox,
     light::{IrradianceVolume, NotShadowCaster},
@@ -25,9 +26,16 @@ use bevy::{
     window::PrimaryWindow,
     world_serialization::WorldInstanceReady,
 };
+use serde::Deserialize;
+use thiserror::Error;
 
 /// This example uses a shader source file from the assets subdirectory
 const SHADER_ASSET_PATH: &str = "shaders/irradiance_volume_voxel_visualization.wesl";
+
+/// The baked irradiance volume texture. Its `.meta.json` sidecar is loaded
+/// automatically to position and scale the volume.
+const IRRADIANCE_VOLUME_ASSET: &str =
+    "irradiance_volumes/lego_technic_bugatti_chiron_lighted_Irradiance_Info.ktx2";
 
 // Rotation speed in radians per frame.
 const ROTATION_SPEED: f32 = 0.2;
@@ -57,12 +65,72 @@ static CLICK_TO_MOVE_HELP_TEXT: &str = "Left click: Move the object";
 
 static GIZMO_COLOR: Color = Color::Srgba(YELLOW);
 
-static VOXEL_FROM_WORLD: Mat4 = Mat4::from_cols_array_2d(&[
-    [-42.317566, 0.0, 0.0, 0.0],
-    [0.0, 0.0, 44.601563, 0.0],
-    [0.0, 16.73776, 0.0, 0.0],
-    [0.0, 6.544792, 0.0, 1.0],
-]);
+/// The metadata that `mutbaker-gui` writes next to a baked irradiance volume.
+#[derive(Asset, TypePath, Debug, Clone, Deserialize)]
+struct IrradianceVolumeMeta {
+    #[serde(default)]
+    bounds_min: Option<[f32; 3]>,
+    #[serde(default)]
+    bounds_max: Option<[f32; 3]>,
+    #[serde(default)]
+    bevy_transform: Option<IrradianceVolumeMetaTransform>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IrradianceVolumeMetaTransform {
+    translation: [f32; 3],
+    scale: [f32; 3],
+}
+
+impl IrradianceVolumeMeta {
+    fn transform(&self) -> Option<Transform> {
+        if let (Some(bounds_min), Some(bounds_max)) = (self.bounds_min, self.bounds_max) {
+            let bounds_min = Vec3::from_array(bounds_min);
+            let bounds_max = Vec3::from_array(bounds_max);
+            return Some(
+                Transform::from_translation((bounds_min + bounds_max) * 0.5)
+                    .with_scale(bounds_max - bounds_min),
+            );
+        }
+
+        self.bevy_transform.as_ref().map(|transform| {
+            Transform::from_translation(Vec3::from_array(transform.translation))
+                .with_scale(Vec3::from_array(transform.scale))
+        })
+    }
+}
+
+#[derive(Default, TypePath)]
+struct IrradianceVolumeMetaLoader;
+
+#[derive(Debug, Error)]
+enum IrradianceVolumeMetaLoaderError {
+    #[error("Could not read irradiance volume metadata: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Could not parse irradiance volume metadata: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl AssetLoader for IrradianceVolumeMetaLoader {
+    type Asset = IrradianceVolumeMeta;
+    type Settings = ();
+    type Error = IrradianceVolumeMetaLoaderError;
+
+    async fn load(
+        &self,
+        reader: &mut dyn Reader,
+        _settings: &(),
+        _load_context: &mut LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["meta.json"]
+    }
+}
 
 // The mode the application is in.
 #[derive(Resource)]
@@ -94,6 +162,9 @@ struct ExampleAssets {
 
     // The 3D texture containing the irradiance volume.
     irradiance_volume: Handle<Image>,
+
+    // The metadata containing the bounds of the irradiance volume.
+    irradiance_volume_meta: Handle<IrradianceVolumeMeta>,
 
     // The plain sphere mesh.
     main_sphere: Handle<Mesh>,
@@ -155,6 +226,8 @@ fn main() {
             }),
             ..default()
         }))
+        .init_asset::<IrradianceVolumeMeta>()
+        .init_asset_loader::<IrradianceVolumeMetaLoader>()
         .add_plugins(MaterialPlugin::<VoxelVisualizationMaterial>::default())
         .init_resource::<AppStatus>()
         .init_resource::<ExampleAssets>()
@@ -164,7 +237,7 @@ fn main() {
             ..default()
         })
         .add_systems(Startup, setup)
-        .add_systems(PreUpdate, create_cubes)
+        .add_systems(PreUpdate, (spawn_irradiance_volume, create_cubes).chain())
         .add_systems(Update, rotate_camera)
         .add_systems(Update, play_animations)
         .add_systems(
@@ -220,7 +293,6 @@ fn main() {
 fn setup(mut commands: Commands, assets: Res<ExampleAssets>, app_status: Res<AppStatus>) {
     spawn_main_scene(&mut commands, &assets);
     spawn_camera(&mut commands, &assets);
-    spawn_irradiance_volume(&mut commands, &assets);
     spawn_sphere(&mut commands, &assets);
     spawn_voxel_cube_parent(&mut commands);
     spawn_fox(&mut commands, &assets);
@@ -245,15 +317,47 @@ fn spawn_camera(commands: &mut Commands, assets: &ExampleAssets) {
     ));
 }
 
-fn spawn_irradiance_volume(commands: &mut Commands, assets: &ExampleAssets) {
+fn spawn_irradiance_volume(
+    mut commands: Commands,
+    assets: Res<ExampleAssets>,
+    irradiance_volume_metas: Res<Assets<IrradianceVolumeMeta>>,
+    irradiance_volumes: Query<(), With<IrradianceVolume>>,
+    mut spawned: Local<bool>,
+    mut warned_missing_transform: Local<bool>,
+) {
+    if *spawned || !irradiance_volumes.is_empty() {
+        return;
+    }
+
+    let Some(meta) = irradiance_volume_metas.get(&assets.irradiance_volume_meta) else {
+        return;
+    };
+
+    let Some(transform) = meta.transform() else {
+        if !*warned_missing_transform {
+            warn!(
+                "Irradiance volume metadata contains neither `bounds_min`/`bounds_max` nor \
+                 `bevy_transform`"
+            );
+            *warned_missing_transform = true;
+        }
+        return;
+    };
+
+    info!(
+        "Spawning irradiance volume from metadata at {:?} with scale {:?}",
+        transform.translation, transform.scale
+    );
+
     commands.spawn((
-        Transform::from_matrix(VOXEL_FROM_WORLD),
+        transform,
         IrradianceVolume {
             voxels: assets.irradiance_volume.clone(),
             intensity: IRRADIANCE_VOLUME_INTENSITY,
             ..default()
         },
     ));
+    *spawned = true;
 }
 
 fn setup_scene_lights(
@@ -526,22 +630,27 @@ impl FromWorld for ExampleAssets {
         let (fox_animation_graph, fox_animation_node) =
             AnimationGraph::from_clip(fox_animation.clone());
 
+        let irradiance_volume = world.load_asset::<Image>(IRRADIANCE_VOLUME_ASSET);
+        let irradiance_volume_meta = world.load_asset::<IrradianceVolumeMeta>(
+            IRRADIANCE_VOLUME_ASSET.replace(".ktx2", ".meta.json"),
+        );
+
         ExampleAssets {
             main_sphere: world.add_asset(Sphere::default().mesh().uv(32, 18)),
             fox: world.load_asset(GltfAssetLabel::Scene(0).from_asset("models/animated/Fox.glb")),
             main_sphere_material: world.add_asset(Color::from(SILVER)),
-            main_scene: world.load_asset(
-                GltfAssetLabel::Scene(0)
-                    .from_asset("models/IrradianceVolumeExample/Scene_test.glb"),
-            ),
-            irradiance_volume: world.load_asset("irradiance_volumes/Scene_test_Irradiance_Info.ktx2"),
+            main_scene: world.load_asset(GltfAssetLabel::Scene(0).from_asset(
+                "models/IrradianceVolumeExample/Scene_test.glb",
+            )),
+            irradiance_volume,
+            irradiance_volume_meta,
             fox_animation_graph: world.add_asset(fox_animation_graph),
             fox_animation_node,
             voxel_cube: world.add_asset(Cuboid::default()),
             // Just use a specular map for the skybox since it's not too blurry.
             // In reality you wouldn't do this--you'd use a real skybox texture--but
             // reusing the textures like this saves space in the Bevy repository.
-            skybox: world.load_asset("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
+            skybox: world.load_asset("environment_maps/Scene_test_Irradiance_Info.ktx2"),
         }
     }
 }
@@ -583,34 +692,38 @@ fn create_cubes(
             continue;
         };
 
-        let resolution = image.texture_descriptor.size;
+        // The texture stores the six cube faces stacked along the Y and Z axes,
+        // so the actual voxel resolution is 1/2 the height and 1/3 the depth.
+        let texture_size = image.texture_descriptor.size;
+        let resolution = uvec3(
+            texture_size.width,
+            texture_size.height / 2,
+            texture_size.depth_or_array_layers / 3,
+        );
 
+        let world_from_voxel = global_transform.to_matrix();
         let voxel_cube_material = voxel_visualization_material_assets.add(ExtendedMaterial {
             base: StandardMaterial::from(Color::from(RED)),
             extension: VoxelVisualizationExtension {
                 irradiance_volume_info: VoxelVisualizationIrradianceVolumeInfo {
-                    world_from_voxel: VOXEL_FROM_WORLD.inverse(),
-                    voxel_from_world: VOXEL_FROM_WORLD,
-                    resolution: uvec3(
-                        resolution.width,
-                        resolution.height,
-                        resolution.depth_or_array_layers,
-                    ),
+                    world_from_voxel,
+                    voxel_from_world: world_from_voxel.inverse(),
+                    resolution,
                     intensity: IRRADIANCE_VOLUME_INTENSITY,
                 },
             },
         });
 
         let scale = vec3(
-            1.0 / resolution.width as f32,
-            1.0 / resolution.height as f32,
-            1.0 / resolution.depth_or_array_layers as f32,
+            1.0 / resolution.x as f32,
+            1.0 / resolution.y as f32,
+            1.0 / resolution.z as f32,
         );
 
         // Spawn a cube for each voxel.
-        for z in 0..resolution.depth_or_array_layers {
-            for y in 0..resolution.height {
-                for x in 0..resolution.width {
+        for z in 0..resolution.z {
+            for y in 0..resolution.y {
+                for x in 0..resolution.x {
                     let uvw = (uvec3(x, y, z).as_vec3() + 0.5) * scale - 0.5;
                     let pos = global_transform.transform_point(uvw);
                     let voxel_cube = commands
