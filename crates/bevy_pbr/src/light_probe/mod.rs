@@ -32,9 +32,14 @@ use bevy_render::{
 use bevy_shader::load_shader_library;
 use bevy_transform::prelude::GlobalTransform;
 use bitflags::bitflags;
-use tracing::error;
+use tracing::{error, info};
 
-use core::{any::TypeId, hash::Hash, ops::Deref};
+use core::{
+    any::TypeId,
+    hash::Hash,
+    ops::Deref,
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 use crate::{
     extract_clusters_for_cpu_clustering, generate::EnvironmentMapGenerationPlugin,
@@ -50,6 +55,144 @@ pub mod irradiance_volume;
 /// Because the fragment shader does a linear search through the list for each
 /// fragment, this number needs to be relatively small.
 pub const MAX_VIEW_LIGHT_PROBES: usize = 8;
+
+/// Controls whether view-level binding arrays (light probes, lightmaps, and
+/// clustered decals) are used.
+///
+/// Binding arrays are also known as *bindless* resources. Disabling them limits
+/// each view to a single irradiance volume and disables reflection probes, so
+/// this is primarily an escape hatch for buggy drivers.
+///
+/// The setting can be changed before the application starts:
+///
+/// ```
+/// # use bevy_pbr::{BindlessSettings, BindlessMode};
+/// # let mut app = bevy_app::App::new();
+/// app.insert_resource(BindlessSettings {
+///     view_binding_arrays: BindlessMode::Disabled,
+/// });
+/// ```
+///
+/// or overridden without code changes with the environment variable:
+///
+/// ```text
+/// BEVY_BINDLESS_VIEW_ARRAYS=auto|on|off
+/// ```
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BindlessSettings {
+    /// Whether to use binding arrays for view-level resources.
+    pub view_binding_arrays: BindlessMode,
+}
+
+impl BindlessSettings {
+    /// A convenient value that always disables view-level binding arrays.
+    pub const DISABLED: Self = Self {
+        view_binding_arrays: BindlessMode::Disabled,
+    };
+}
+
+/// The policy used to decide whether view-level binding arrays are enabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BindlessMode {
+    /// Enable binding arrays when the hardware supports them and the adapter is
+    /// not on a known-bad driver list.
+    #[default]
+    Auto = 0,
+    /// Force binding arrays on when the hardware supports them, ignoring the
+    /// known-bad driver list.
+    Enabled = 1,
+    /// Always disable binding arrays.
+    Disabled = 2,
+}
+
+impl BindlessMode {
+    /// Parses a value from the `BEVY_BINDLESS_VIEW_ARRAYS` environment variable.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            Some(Self::Auto)
+        } else if value.eq_ignore_ascii_case("on")
+            || value.eq_ignore_ascii_case("true")
+            || value == "1"
+            || value.eq_ignore_ascii_case("enabled")
+        {
+            Some(Self::Enabled)
+        } else if value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("false")
+            || value == "0"
+            || value.eq_ignore_ascii_case("disabled")
+        {
+            Some(Self::Disabled)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod bindless_mode_tests {
+    use super::BindlessMode;
+
+    #[test]
+    fn parses_bindless_mode_values() {
+        assert_eq!(BindlessMode::parse("auto"), Some(BindlessMode::Auto));
+        assert_eq!(BindlessMode::parse("ON"), Some(BindlessMode::Enabled));
+        assert_eq!(BindlessMode::parse("1"), Some(BindlessMode::Enabled));
+        assert_eq!(BindlessMode::parse("off"), Some(BindlessMode::Disabled));
+        assert_eq!(BindlessMode::parse("false"), Some(BindlessMode::Disabled));
+        assert_eq!(BindlessMode::parse("nonsense"), None);
+    }
+}
+
+/// Process-wide mode used by the pipeline initialization code, which doesn't
+/// have access to the main-world [`BindlessSettings`] resource.
+///
+/// This is set from [`BindlessSettings`] (and the environment variable
+/// override) in [`PbrPlugin::finish`](crate::PbrPlugin).
+static VIEW_BINDING_ARRAYS_MODE: AtomicU8 = AtomicU8::new(BindlessMode::Auto as u8);
+
+/// Ensures the bindless decision is logged only once, even though
+/// [`binding_arrays_are_usable`] is called from several pipeline setup paths.
+static BINDING_ARRAY_LOG_ONCE: AtomicBool = AtomicBool::new(false);
+
+fn view_binding_arrays_mode() -> BindlessMode {
+    match VIEW_BINDING_ARRAYS_MODE.load(Ordering::Relaxed) {
+        value if value == BindlessMode::Enabled as u8 => BindlessMode::Enabled,
+        value if value == BindlessMode::Disabled as u8 => BindlessMode::Disabled,
+        _ => BindlessMode::Auto,
+    }
+}
+
+/// Sets the process-wide view-level binding-array policy.
+///
+/// This is called by [`PbrPlugin::finish`](crate::PbrPlugin) from the
+/// [`BindlessSettings`] resource, after applying the
+/// `BEVY_BINDLESS_VIEW_ARRAYS` override.
+pub(crate) fn set_view_binding_arrays_mode(mode: BindlessMode) {
+    VIEW_BINDING_ARRAYS_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+/// Adreno GPUs up to and including this model are known to claim bindless
+/// support but render incorrectly. Newer Adreno GPUs (including the Adreno 690
+/// in the 8cx Gen 3) are allowed by [`BindlessMode::Auto`].
+const ADRENO_MAX_BUGGY_MODEL: u32 = 610;
+
+/// `AdapterInfo::driver` version prefixes that should disable view-level
+/// binding arrays in [`BindlessMode::Auto`].
+///
+/// Add a driver here if a specific version is found to be unstable. Prefer this
+/// over disabling binding arrays for every Adreno GPU.
+const BINDLESS_DRIVER_DENYLIST: &[&str] = &[
+    // Example:
+    // "30.0.4369.8700",
+];
+
+fn driver_is_denylisted(driver: &str) -> bool {
+    BINDLESS_DRIVER_DENYLIST
+        .iter()
+        .any(|denied| driver.starts_with(denied))
+}
 
 /// How many texture bindings are used in the fragment shader, *not* counting
 /// environment maps or irradiance volumes.
@@ -765,10 +908,14 @@ pub(crate) fn add_cubemap_texture_view<'a>(
 ///
 /// 2. If binding arrays aren't supported on the hardware, then we obviously
 ///    can't use them. Adreno <= 610 claims to support bindless, but seems to be
-///    too buggy to be usable.
+///    too buggy to be usable, so [`BindlessMode::Auto`] keeps those GPUs on the
+///    single-probe path. Newer Adreno GPUs are allowed.
 ///
 /// 3. If binding arrays are supported on the hardware, but they can only be
 ///    accessed by uniform indices, that's not good enough, and we bail out.
+///
+/// 4. The user can explicitly disable view-level binding arrays through
+///    [`BindlessSettings`] or `BEVY_BINDLESS_VIEW_ARRAYS=off`.
 ///
 /// If binding arrays aren't usable, we disable reflection probes and limit the
 /// number of irradiance volumes in the scene to 1.
@@ -776,14 +923,34 @@ pub(crate) fn binding_arrays_are_usable(
     render_device: &RenderDevice,
     render_adapter: &RenderAdapter,
 ) -> bool {
-    let adapter_info = RenderAdapterInfo::new(render_adapter.get_info());
+    let mode = view_binding_arrays_mode();
+    if mode == BindlessMode::Disabled {
+        if !BINDING_ARRAY_LOG_ONCE.swap(true, Ordering::Relaxed) {
+            info!("View binding arrays disabled by BindlessSettings or BEVY_BINDLESS_VIEW_ARRAYS");
+        }
+        return false;
+    }
 
-    bevy_render::get_adreno_model(&adapter_info).is_none_or(|model| model > 610)
-        && render_device
-            .limits()
-            .max_binding_array_elements_per_shader_stage
-            >= (STANDARD_MATERIAL_FRAGMENT_SHADER_MIN_TEXTURE_BINDINGS + MAX_VIEW_LIGHT_PROBES)
-                as u32
+    let adapter_info = render_adapter.get_info();
+    let adreno_model =
+        bevy_render::get_adreno_model(&RenderAdapterInfo::new(render_adapter.get_info()));
+    let known_bad_adreno = adreno_model.is_some_and(|model| model <= ADRENO_MAX_BUGGY_MODEL);
+    let known_bad_driver = driver_is_denylisted(&adapter_info.driver);
+
+    if mode == BindlessMode::Auto && (known_bad_adreno || known_bad_driver) {
+        if !BINDING_ARRAY_LOG_ONCE.swap(true, Ordering::Relaxed) {
+            info!(
+                "View binding arrays disabled for adapter {:?} (driver {:?}, Adreno model {:?})",
+                adapter_info.name, adapter_info.driver, adreno_model
+            );
+        }
+        return false;
+    }
+
+    let usable = render_device
+        .limits()
+        .max_binding_array_elements_per_shader_stage
+        >= (STANDARD_MATERIAL_FRAGMENT_SHADER_MIN_TEXTURE_BINDINGS + MAX_VIEW_LIGHT_PROBES) as u32
         && render_device
             .limits()
             .max_binding_array_sampler_elements_per_shader_stage
@@ -792,5 +959,18 @@ pub(crate) fn binding_arrays_are_usable(
         && render_device.features().contains(
             WgpuFeatures::TEXTURE_BINDING_ARRAY
                 | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
-        )
+        );
+
+    if !BINDING_ARRAY_LOG_ONCE.swap(true, Ordering::Relaxed) {
+        info!(
+            "View binding arrays {} for adapter {:?} (driver {:?}, Adreno model {:?}, mode {:?})",
+            if usable { "enabled" } else { "unavailable" },
+            adapter_info.name,
+            adapter_info.driver,
+            adreno_model,
+            mode
+        );
+    }
+
+    usable
 }

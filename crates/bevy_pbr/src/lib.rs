@@ -92,6 +92,7 @@ pub mod prelude {
         parallax::ParallaxMappingMethod,
         pbr_material::StandardMaterial,
         ssao::ScreenSpaceAmbientOcclusionPlugin,
+        BindlessMode, BindlessSettings,
     };
 }
 
@@ -180,6 +181,8 @@ pub struct DfgLut {
 
 impl Plugin for PbrPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<BindlessSettings>();
+
         load_shader_library!(app, "render/pbr_types.wesl");
         load_shader_library!(app, "render/pbr_bindings.wesl");
         load_shader_library!(app, "cluster.wesl");
@@ -432,6 +435,26 @@ impl Plugin for PbrPlugin {
     }
 
     fn finish(&self, app: &mut App) {
+        // Resolve the view-level binding-array policy before any render
+        // pipelines are initialized. The environment variable takes precedence
+        // so a bad driver can be worked around without rebuilding.
+        let settings = app
+            .world()
+            .get_resource::<BindlessSettings>()
+            .copied()
+            .unwrap_or_default();
+        let mode = match std::env::var("BEVY_BINDLESS_VIEW_ARRAYS") {
+            Ok(value) => BindlessMode::parse(&value).unwrap_or_else(|| {
+                tracing::warn!(
+                    "Invalid BEVY_BINDLESS_VIEW_ARRAYS value {value:?}; using {:?}",
+                    settings.view_binding_arrays
+                );
+                settings.view_binding_arrays
+            }),
+            Err(_) => settings.view_binding_arrays,
+        };
+        set_view_binding_arrays_mode(mode);
+
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
