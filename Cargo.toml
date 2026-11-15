@@ -46,6 +46,8 @@ members = [
 exclude = [
   # Integration tests are not part of the workspace
   "tests-integration",
+  # Standalone action game renderer prototype
+  "examples/action_renderer",
 ]
 
 [workspace.lints.clippy]
