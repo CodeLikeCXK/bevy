@@ -20,7 +20,7 @@ fn resolve_depth(in: FullscreenVertexOutput) -> @builtin(frag_depth) f32 {
     let depth = meshlet_depth_buffer[frag_coord_1d];
     if depth == 0u { discard; }
 
-    return bitcast<f32>(depth);
+    return clamp(bitcast<f32>(depth), 0.0, 1.0);
 }
 
 /// This pass writes out the material depth texture.

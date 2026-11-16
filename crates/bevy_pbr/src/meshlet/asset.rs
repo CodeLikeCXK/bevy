@@ -60,6 +60,18 @@ pub struct MeshletMesh {
     pub(crate) bvh_depth: u32,
 }
 
+impl MeshletMesh {
+    /// Returns the total number of meshlet clusters (across all LOD levels) in this asset.
+    pub fn meshlet_count(&self) -> usize {
+        self.meshlets.len()
+    }
+
+    /// Returns the total number of triangles stored across all LOD levels in this asset.
+    pub fn total_triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+}
+
 /// A single BVH8 node in the BVH used for culling and LOD selection of a [`MeshletMesh`].
 #[derive(Copy, Clone, Default, Pod, Zeroable)]
 #[repr(C)]

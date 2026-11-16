@@ -622,11 +622,11 @@ impl FromWorld for ExampleAssets {
     fn from_world(world: &mut World) -> Self {
         // Asset paths.
         let fox_asset = "models/animated/Fox.glb";
-        let scene_asset = "models/IrradianceVolumeExample/Scene_test.glb";
+        let scene_asset = "models/IrradianceVolumeExample/Sponza_Full_ForLight.glb";
         // The baked irradiance volume texture. Its `.meta.json` sidecar is
         // loaded automatically to position and scale the volume.
         let irradiance_volume_asset =
-            "irradiance_volumes/Scene_test_Irradiance_Info.ktx2";
+            "irradiance_volumes/Sponza_Full_ForLight.irradiance.vxgi.ktx2";
 
         let fox_animation = world.load_asset(GltfAssetLabel::Animation(1).from_asset(fox_asset));
         let (fox_animation_graph, fox_animation_node) =

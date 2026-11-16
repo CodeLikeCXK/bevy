@@ -169,7 +169,7 @@ fn rasterize_cluster(
 }
 
 fn write_visibility_buffer_pixel(x: f32, y: f32, z: f32, packed_ids: u32) {
-    let depth = bitcast<u32>(z);
+    let depth = bitcast<u32>(clamp(z, 0.0, 1.0));
     let frag_coord_1d = u32(y) * u32(view.viewport.z) + u32(x);
     @if(MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT) {
         let prev = atomicMax(&meshlet_depth_buffer[frag_coord_1d], depth);

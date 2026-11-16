@@ -1,3 +1,4 @@
+mod lod_mesh;
 mod scene;
 
 use std::path::{Path, PathBuf};
@@ -50,6 +51,22 @@ struct Args {
     /// 场景模式下导出 GLB 内嵌/引用贴图到输出目录的 textures/ 子目录
     #[arg(long, default_value_t = false)]
     export_textures: bool,
+
+    /// 导出贴图的最大边长（像素）；超过该尺寸将按比例降采样，0 表示不限制（针对集显/轻薄本推荐 1024 或 512）
+    #[arg(long, default_value_t = 1024)]
+    max_texture_size: u32,
+
+    /// 场景模式下静态合批的空间网格边长（米），用于自动切分超大房间以便分块流送卸载；0 表示禁用空间切分
+    #[arg(long, default_value_t = 12.0)]
+    grid_size: f32,
+
+    /// 场景模式下单个静态 Meshlet 批次的最大三角形数上限，超出自动拆批；0 表示不限制
+    #[arg(long, default_value_t = 250000)]
+    max_batch_tris: usize,
+
+    /// 场景模式下同一图元出现 >= N 次时自动走局部实例化复用（不并入静态大网格）；0 表示禁用自动实例化
+    #[arg(long, default_value_t = 3)]
+    auto_instance_min: usize,
 }
 
 use bevy_tasks::{AsyncComputeTaskPool, TaskPool};
@@ -93,6 +110,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             merge_by_material: !args.no_merge,
             dynamic_prefixes: &args.dynamic_prefixes,
             export_textures: args.export_textures,
+            max_texture_size: args.max_texture_size,
+            grid_size: args.grid_size,
+            max_batch_tris: args.max_batch_tris,
+            auto_instance_min: args.auto_instance_min,
         };
         return scene::run_scene_export(&document, &buffers, &images, &options);
     }

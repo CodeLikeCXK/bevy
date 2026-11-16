@@ -669,11 +669,17 @@ fn build_and_compress_per_meshlet_vertex_data(
 }
 
 fn merge_spheres(a: BoundingSphere, b: BoundingSphere) -> BoundingSphere {
+    if a.radius() < 0.0 {
+        return b;
+    }
+    if b.radius() < 0.0 {
+        return a;
+    }
     let sr = a.radius().min(b.radius());
     let br = a.radius().max(b.radius());
     let len = a.center.distance(b.center);
-    if len + sr <= br || sr == 0.0 || len == 0.0 {
-        if a.radius() > b.radius() {
+    if len + sr <= br || len == 0.0 {
+        if a.radius() >= b.radius() {
             a
         } else {
             b
@@ -705,7 +711,8 @@ impl Default for TempMeshletGroup {
     fn default() -> Self {
         Self {
             aabb: aabb_default(), // Default AABB to merge into
-            lod_bounds: BoundingSphere::new(Vec3A::ZERO, 0.0),
+            // Use negative radius as uninitialized sentinel so valid zero-radius spheres still merge properly
+            lod_bounds: BoundingSphere::new(Vec3A::ZERO, -1.0),
             parent_error: f32::MAX,
             meshlets: SmallVec::new(),
         }
@@ -891,7 +898,7 @@ impl BvhBuilder {
                 let child = &out[child_id as usize];
                 let mut aabb = aabb_default();
                 let mut parent_error = 0.0f32;
-                let mut lod_bounds = BoundingSphere::new(Vec3A::ZERO, 0.0);
+                let mut lod_bounds = BoundingSphere::new(Vec3A::ZERO, -1.0);
                 for i in 0..8 {
                     if child.child_counts[i] == 0 {
                         break;
@@ -906,6 +913,9 @@ impl BvhBuilder {
                         BoundingSphere::new(child.lod_bounds[i].center, child.lod_bounds[i].radius),
                     );
                     parent_error = parent_error.max(child.aabbs[i].error);
+                }
+                if lod_bounds.radius() < 0.0 {
+                    lod_bounds = BoundingSphere::new(Vec3A::ZERO, 0.0);
                 }
 
                 let out = &mut out[onode];

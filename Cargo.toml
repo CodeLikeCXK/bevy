@@ -48,6 +48,8 @@ exclude = [
   "tests-integration",
   # Standalone action game renderer prototype
   "examples/action_renderer",
+  # Python bytecode cache if Python scripts under tools/ are imported/compiled
+  "tools/__pycache__",
 ]
 
 [workspace.lints.clippy]

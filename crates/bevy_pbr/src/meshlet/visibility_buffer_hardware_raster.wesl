@@ -61,7 +61,9 @@ fn vertex(@builtin(instance_index) instance_index: u32, @builtin(vertex_index) v
 
 @fragment
 fn fragment(vertex_output: VertexOutput) {
-    let depth = bitcast<u32>(vertex_output.position.z);
+    // Clamp unclamped directional shadow depths to [0, 1] before bitcasting so negative
+    // far-out-of-bounds depths cannot win atomicMax via their IEEE-754 sign bit.
+    let depth = bitcast<u32>(clamp(vertex_output.position.z, 0.0, 1.0));
     let frag_coord_1d = u32(vertex_output.position.y) * u32(view.viewport.z) + u32(vertex_output.position.x);
     @if(MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT) {
         let prev = atomicMax(&meshlet_depth_buffer[frag_coord_1d], depth);

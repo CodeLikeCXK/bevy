@@ -58,3 +58,6 @@ assets/models/IrradianceVolumeExample/lego_technic_bugatti_chiron.glb
 assets/models/IrradianceVolumeExample/lego_technic_bugatti_chiron_lighted.glb
 assets/irradiance_volumes/lego_technic_bugatti_chiron_lighted_Irradiance_Info.ktx2
 assets/irradiance_volumes/lego_technic_bugatti_chiron_lighted_Irradiance_Info.meta.json
+assets/irradiance_volumes/Sponza_Full_ForLight.irradiance.vxgi.ktx2
+assets/irradiance_volumes/Sponza_Full_ForLight.irradiance.vxgi.meta.json
+assets/models/IrradianceVolumeExample/Sponza_Full_ForLight.glb

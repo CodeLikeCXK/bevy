@@ -167,13 +167,6 @@ fn occlusion_cull_screen_aabb(aabb: ScreenAabb, screen: vec2<f32>) -> bool {
     return aabb.max.z <= curr_depth;
 }
 
-fn occlusion_cull_projection() -> mat4x4<f32> {
-    @if(MESHLET_FIRST_CULLING_PASS)
-    return previous_view.clip_from_world;
-    @else
-    return view.clip_from_world;
-}
-
 fn occlusion_cull_clip_from_local(instance_id: u32) -> mat4x4<f32> {
     @if(MESHLET_FIRST_CULLING_PASS)
     let prev_world_from_local = affine3_to_square(meshlet_instance_uniforms[instance_id].previous_world_from_local);
@@ -186,13 +179,13 @@ fn occlusion_cull_clip_from_local(instance_id: u32) -> mat4x4<f32> {
 }
 
 fn should_occlusion_cull_aabb(aabb: MeshletAabb, instance_id: u32) -> bool {
-    let projection = occlusion_cull_projection();
-    var near: f32;
-    if projection[3][3] == 1.0 {
-        near = projection[3][2] / projection[2][2];
-    } else {
-        near = projection[3][2];
+    // Use clip_from_view for near-plane extraction; skip orthographic shadow cascades
+    // because ShadowView does not track PreviousViewData across frames.
+    let view_projection = view.clip_from_view;
+    if view_projection[3][3] == 1.0 {
+        return false;
     }
+    let near = view_projection[3][2];
 
     let clip_from_local = occlusion_cull_clip_from_local(instance_id);
     var screen_aabb = ScreenAabb(vec3<f32>(0.0), vec3<f32>(0.0));

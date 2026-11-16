@@ -12,9 +12,12 @@ bevy_pbr = { path = "../../crates/bevy_pbr", features = ["meshlet", "meshlet_pro
 bevy_asset = { path = "../../crates/bevy_asset" }
 bevy_math = { path = "../../crates/bevy_math" }
 bevy_tasks = { path = "../../crates/bevy_tasks" }
-gltf = { version = "1.4.0", default-features = false, features = ["names", "utils", "import", "KHR_lights_punctual"] }
+gltf = { version = "1.4.0", default-features = false, features = ["names", "utils", "import", "KHR_lights_punctual", "extras"] }
 clap = { version = "4.0", features = ["derive"] }
 futures-io = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 image = { version = "0.25.2", default-features = false, features = ["png"] }
+meshopt = "0.6.2"
+lz4_flex = { version = "0.13", default-features = false, features = ["frame"] }
+bytemuck = "1"

@@ -379,6 +379,11 @@ pub fn init_meshlet_pipelines(
                     })],
                     ..default()
                 }),
+                primitive: PrimitiveState {
+                    // Directional cascades rely on depth clamping for casters behind the near plane.
+                    unclipped_depth: true,
+                    ..default()
+                },
                 ..default()
             }),
 
