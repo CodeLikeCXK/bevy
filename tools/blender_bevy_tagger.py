@@ -94,6 +94,7 @@ METAL_KEYWORDS = (
 FOLIAGE_KEYWORDS = (
     "leaf", "leaves", "foliage", "ivy", "tree", "bush", "plant",
     "fern", "grass", "flower", "vine", "branch", "hedge",
+    "cypress", "canopy", "twig", "needle", "pine", "oak", "shrub", "bough", "frond", "crown",
 )
 
 
@@ -149,6 +150,11 @@ class BevyPipelineSettings(bpy.types.PropertyGroup):
         name="LOD 切换距离",
         description="逗号分隔的距离上限（米），最后一级表示完全剔除距离（例如 18,45,120）",
         default="18,45,120",
+    )
+    cast_shadows: BoolProperty(
+        name="投射实时阴影",
+        description="取消勾选后写入 bevy_cast_shadow=False，Meshlet/Mesh3d 将挂载 NotShadowCaster 跳过阴影光栅化（适合高密藤蔓/碎物）",
+        default=True,
     )
     spawn_group: StringProperty(
         name="Gameplay 分组",
@@ -276,6 +282,12 @@ class BEVY_OT_apply_tag(bpy.types.Operator):
                 obj["bevy_lod_dists"] = settings.lod_dists.strip() or defaults["bevy_lod_dists"]
             if "bevy_spawn_group" in defaults:
                 obj["bevy_spawn_group"] = settings.spawn_group.strip() or defaults["bevy_spawn_group"]
+            if self.tag_id not in {"GAME_SPAWN", "GAME_COLLIDER"}:
+                if settings.cast_shadows:
+                    if "bevy_cast_shadow" in obj:
+                        del obj["bevy_cast_shadow"]
+                else:
+                    obj["bevy_cast_shadow"] = False
 
             # 设置 Solid 视图颜色，便于无材质着色器编译环境下可视化检查分类结果
             obj.color = color_rgba
@@ -294,7 +306,7 @@ class BEVY_OT_clear_tag(bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.bevy_pipeline_settings
         targets = _collect_target_objects(context, settings.target_scope == "COLLECTION")
-        keys = ("bevy_tag", "bevy_chunk", "bevy_lod_ratios", "bevy_lod_dists", "bevy_spawn_group")
+        keys = ("bevy_tag", "bevy_chunk", "bevy_lod_ratios", "bevy_lod_dists", "bevy_spawn_group", "bevy_cast_shadow")
         count = 0
         for obj in targets:
             for k in keys:
@@ -325,8 +337,21 @@ class BEVY_OT_select_by_tag(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _mat_is_alpha_blend(mat) -> bool:
+    """检测材质是否会以 glTF AlphaMode::Blend 导出（易触发 Transparent Pass 过绘）。"""
+    if not mat:
+        return False
+    blend_method = getattr(mat, "blend_method", None)
+    if blend_method == "BLEND":
+        return True
+    surface_method = getattr(mat, "surface_render_method", None)
+    if surface_method == "BLENDED":
+        return True
+    return False
+
+
 class BEVY_OT_fix_fbx_materials(bpy.types.Operator):
-    """清洗 FBX 导入材质：修复非金属物体的错误金属度，并将植物材质设为 AlphaClip"""
+    """清洗 FBX 导入材质：修复非金属物体的错误金属度，并将植物/MESH3D_LOD材质设为 AlphaClip"""
     bl_idname = "bevy.fix_fbx_materials"
     bl_label = "一键清洗 FBX 材质 (金属度 + 植物AlphaClip)"
     bl_options = {"REGISTER", "UNDO"}
@@ -335,13 +360,30 @@ class BEVY_OT_fix_fbx_materials(bpy.types.Operator):
         fixed_metallic = 0
         fixed_foliage = 0
 
+        # 收集被标为 MESH3D_LOD 或物体名命中植物关键字的材质，避免材质命名不含关键字时漏洗
+        foliage_mat_ptrs = set()
+        for obj in context.scene.objects:
+            if obj.type != "MESH":
+                continue
+            obj_is_foliage = (
+                obj.get("bevy_tag") == "MESH3D_LOD"
+                or any(kw in obj.name.lower() for kw in FOLIAGE_KEYWORDS)
+            )
+            if obj_is_foliage:
+                for slot in obj.material_slots:
+                    if slot.material:
+                        foliage_mat_ptrs.add(slot.material.as_pointer())
+
         for mat in bpy.data.materials:
             if not mat.use_nodes or not mat.node_tree:
                 continue
 
             mat_name_lower = mat.name.lower()
             is_metal = any(kw in mat_name_lower for kw in METAL_KEYWORDS)
-            is_foliage = any(kw in mat_name_lower for kw in FOLIAGE_KEYWORDS)
+            is_foliage = (
+                any(kw in mat_name_lower for kw in FOLIAGE_KEYWORDS)
+                or mat.as_pointer() in foliage_mat_ptrs
+            )
 
             # 查找 Principled BSDF 节点调整 Metallic 与 Alpha
             for node in mat.node_tree.nodes:
@@ -351,19 +393,80 @@ class BEVY_OT_fix_fbx_materials(bpy.types.Operator):
                         if metallic_input.default_value > 0.0:
                             metallic_input.default_value = 0.0
                             fixed_metallic += 1
+                    if is_foliage:
+                        alpha_input = node.inputs.get("Alpha")
+                        if alpha_input and not alpha_input.is_linked and alpha_input.default_value < 0.99:
+                            alpha_input.default_value = 1.0
 
-            # 兼容不同 Blender 版本的 Alpha Clip 设置（导出 glTF 时会映射为 AlphaMode::Mask）
-            if is_foliage and hasattr(mat, "blend_method"):
-                if mat.blend_method == "BLEND":
+            # 兼容 Blender 3.x/4.x 的 Alpha Clip 与 Blender 4.2+ EEVEE Next surface_render_method
+            if is_foliage:
+                changed = False
+                if hasattr(mat, "blend_method") and mat.blend_method in {"BLEND", "HASHED"}:
                     mat.blend_method = "CLIP"
                     if hasattr(mat, "alpha_threshold"):
                         mat.alpha_threshold = 0.5
+                    changed = True
+                if hasattr(mat, "surface_render_method") and mat.surface_render_method == "BLENDED":
+                    mat.surface_render_method = "DITHERED"
+                    changed = True
+                if changed:
                     fixed_foliage += 1
 
         self.report(
             {"INFO"},
             f"材质清洗完成：修复 {fixed_metallic} 个非金属度，转换 {fixed_foliage} 个植物 AlphaClip",
         )
+        return {"FINISHED"}
+
+
+class BEVY_OT_set_cast_shadow(bpy.types.Operator):
+    """批量开启或关闭选中物体/集合的实时阴影投射 (bevy_cast_shadow)"""
+    bl_idname = "bevy.set_cast_shadow"
+    bl_label = "设置实时阴影投射"
+    bl_options = {"REGISTER", "UNDO"}
+
+    enable_shadow: BoolProperty(default=True)
+
+    def execute(self, context):
+        settings = context.scene.bevy_pipeline_settings
+        targets = _collect_target_objects(context, settings.target_scope == "COLLECTION")
+        if not targets:
+            self.report({"WARNING"}, "未选中任何物体或激活集合为空")
+            return {"CANCELLED"}
+        count = 0
+        for obj in targets:
+            if obj.type != "MESH":
+                continue
+            if self.enable_shadow:
+                if "bevy_cast_shadow" in obj:
+                    del obj["bevy_cast_shadow"]
+            else:
+                obj["bevy_cast_shadow"] = False
+            count += 1
+        state = "开启" if self.enable_shadow else "关闭(NotShadowCaster)"
+        self.report({"INFO"}, f"已为 {count} 个网格 {state} 实时阴影投射")
+        return {"FINISHED"}
+
+
+class BEVY_OT_disable_foliage_shadows(bpy.types.Operator):
+    """自动为所有 MESH3D_LOD 或植物关键词物体关闭实时阴影投射，大幅降低 Meshlet 阴影 Pass 耗时"""
+    bl_idname = "bevy.disable_foliage_shadows"
+    bl_label = "高密植物一键关闭阴影 (NotShadowCaster)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        count = 0
+        for obj in context.scene.objects:
+            if obj.type != "MESH":
+                continue
+            is_foliage = (
+                obj.get("bevy_tag") == "MESH3D_LOD"
+                or any(kw in obj.name.lower() for kw in FOLIAGE_KEYWORDS)
+            )
+            if is_foliage:
+                obj["bevy_cast_shadow"] = False
+                count += 1
+        self.report({"INFO"}, f"已为 {count} 个植物/LOD 网格写入 bevy_cast_shadow=False")
         return {"FINISHED"}
 
 
@@ -437,6 +540,8 @@ def _collect_audit_issues(context, visible_only: bool, max_subsurf: int):
         "BAD_SCALE": [],
         "DEGENERATE_MESH": [],
         "ZERO_OR_AREA_LIGHT": [],
+        "ALPHA_BLEND": [],
+        "HIGH_POLY_FOLIAGE": [],
     }
     mesh_deg_cache = {}
     mat_risk_cache = {}
@@ -488,8 +593,9 @@ def _collect_audit_issues(context, visible_only: bool, max_subsurf: int):
         if mesh_deg_cache[m_ptr]:
             issues["DEGENERATE_MESH"].append(obj)
 
-        # 5. 非 glTF 兼容材质风险
+        # 5. 非 glTF 兼容材质风险 & AlphaBlend 过绘陷阱检测
         obj_bad_mat = False
+        obj_has_alpha_blend = False
         for slot in obj.material_slots:
             mat = slot.material
             if not mat:
@@ -500,8 +606,20 @@ def _collect_audit_issues(context, visible_only: bool, max_subsurf: int):
                 mat_risk_cache[mp] = _material_has_gltf_risk(mat)
             if mat_risk_cache[mp]:
                 obj_bad_mat = True
+            if _mat_is_alpha_blend(mat):
+                obj_has_alpha_blend = True
         if obj_bad_mat:
             issues["BAD_MATERIAL"].append(obj)
+        if obj_has_alpha_blend:
+            issues["ALPHA_BLEND"].append(obj)
+
+        # 6. 高面数植物检测（提示先用离散叶片抽稀或关闭实时阴影）
+        is_foliage_obj = (
+            obj.get("bevy_tag") == "MESH3D_LOD"
+            or any(kw in obj.name.lower() for kw in FOLIAGE_KEYWORDS)
+        )
+        if is_foliage_obj and est_tris > 100_000:
+            issues["HIGH_POLY_FOLIAGE"].append(obj)
 
     heavy_list.sort(key=lambda item: item[0], reverse=True)
     return {
@@ -527,8 +645,8 @@ class BEVY_OT_audit_scene(bpy.types.Operator):
         issues = report["issues"]
         lines = [
             f"网格: {report['export_mesh_count']} (过滤隐藏 {report['hidden_skipped']}) | 估算面数: {report['total_est_tris']:,} | 材质: {report['unique_mats']}",
-            f"高细分(>L{settings.max_subsurf_level}): {len(issues['HEAVY_SUBSURF'])} | 材质丢失风险: {len(issues['BAD_MATERIAL'])}",
-            f"缺UV: {len(issues['MISSING_UV'])} | 退化面Mesh: {len(issues['DEGENERATE_MESH'])} | 异常缩放: {len(issues['BAD_SCALE'])} | 问题灯: {len(issues['ZERO_OR_AREA_LIGHT'])}",
+            f"高细分(>L{settings.max_subsurf_level}): {len(issues['HEAVY_SUBSURF'])} | 材质丢失风险: {len(issues['BAD_MATERIAL'])} | AlphaBlend: {len(issues['ALPHA_BLEND'])}",
+            f"缺UV: {len(issues['MISSING_UV'])} | 退化面Mesh: {len(issues['DEGENERATE_MESH'])} | 高面植物(>10万): {len(issues['HIGH_POLY_FOLIAGE'])} | 异常缩放: {len(issues['BAD_SCALE'])} | 问题灯: {len(issues['ZERO_OR_AREA_LIGHT'])}",
         ]
         settings.audit_summary = "\n".join(lines)
         if report["heavy_top5"]:
@@ -1286,8 +1404,10 @@ class BEVY_PT_pipeline_panel(bpy.types.Panel):
         status_box = layout.box()
         if active:
             cur_tag = active.get("bevy_tag", "未打标 (默认 MESHLET_STATIC)")
+            cur_shadow = "开启" if active.get("bevy_cast_shadow", True) else "关闭 (NotShadowCaster)"
             status_box.label(text=f"当前物体: {active.name}", icon="OBJECT_DATA")
             status_box.label(text=f"当前角标: {cur_tag}", icon="BOOKMARKS")
+            status_box.label(text=f"实时阴影: {cur_shadow}", icon="LIGHT_SUN")
             if "bevy_chunk" in active:
                 status_box.label(text=f"Chunk: {active['bevy_chunk']}")
         else:
@@ -1300,6 +1420,7 @@ class BEVY_PT_pipeline_panel(bpy.types.Panel):
         param_box.prop(settings, "chunk_name")
         param_box.prop(settings, "lod_ratios")
         param_box.prop(settings, "lod_dists")
+        param_box.prop(settings, "cast_shadows")
         param_box.prop(settings, "spawn_group")
 
         # 动态渲染注册表中的所有角标按钮
@@ -1312,6 +1433,12 @@ class BEVY_PT_pipeline_panel(bpy.types.Panel):
             sel_op = row.operator("bevy.select_by_tag", text="", icon="RESTRICT_SELECT_OFF")
             sel_op.tag_id = tag_id
 
+        shadow_row = tag_box.row(align=True)
+        op_sh_on = shadow_row.operator("bevy.set_cast_shadow", text="开启阴影")
+        op_sh_on.enable_shadow = True
+        op_sh_off = shadow_row.operator("bevy.set_cast_shadow", text="关闭阴影")
+        op_sh_off.enable_shadow = False
+        tag_box.operator("bevy.disable_foliage_shadows", icon="OUTLINER_OB_FORCE_FIELD")
         tag_box.operator("bevy.clear_tag", icon="X")
 
         # 场景体检与非游戏资产净化区
@@ -1337,6 +1464,11 @@ class BEVY_PT_pipeline_panel(bpy.types.Panel):
             op.issue_kind = "BAD_SCALE"
             op = sel_row2.operator("bevy.select_audit_issue", text="问题灯")
             op.issue_kind = "ZERO_OR_AREA_LIGHT"
+            sel_row3 = audit_box.row(align=True)
+            op = sel_row3.operator("bevy.select_audit_issue", text="AlphaBlend")
+            op.issue_kind = "ALPHA_BLEND"
+            op = sel_row3.operator("bevy.select_audit_issue", text="高面植物")
+            op.issue_kind = "HIGH_POLY_FOLIAGE"
 
         audit_box.prop(settings, "max_subsurf_level")
         audit_box.operator("bevy.clamp_subsurf", icon="MOD_SUBSURF")
@@ -1379,6 +1511,8 @@ CLASSES = (
     BEVY_OT_decimate_discrete_leaves,
     BEVY_OT_merge_similar_materials,
     BEVY_OT_fix_fbx_materials,
+    BEVY_OT_set_cast_shadow,
+    BEVY_OT_disable_foliage_shadows,
     BEVY_OT_fix_zero_lights,
     BEVY_OT_export_glb,
     BEVY_PT_pipeline_panel,

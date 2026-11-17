@@ -90,6 +90,10 @@ struct Args {
     /// 静态逐顶点 AO 射线法线偏移量（米）；未指定时自动取 clamp(ao_radius * 0.0025, 0.0005, 0.01)
     #[arg(long)]
     ao_bias: Option<f32>,
+
+    /// 允许显式标记为 MESH3D_LOD 的物体保留 glTF AlphaMode::Blend（默认自动转为 AlphaMode::Mask 以避免透明过绘瓶颈）
+    #[arg(long, default_value_t = false)]
+    lod_keep_blend: bool,
 }
 
 use bevy_tasks::{AsyncComputeTaskPool, TaskPool};
@@ -157,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_batch_tris: args.max_batch_tris,
             auto_instance_min: args.auto_instance_min,
             ao: ao_config,
+            lod_keep_blend: args.lod_keep_blend,
         };
         return scene::run_scene_export(&document, &buffers, &images, &options);
     }

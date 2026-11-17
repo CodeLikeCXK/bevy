@@ -25,6 +25,9 @@ import package::render::pbr_functions::visibility_range_dither;
 @if(MESHLET_MESH_MATERIAL_PASS)
 import package::meshlet::visibility_buffer_resolve::resolve_vertex_output;
 
+@if(MESHLET_MESH_MATERIAL_PASS && AO_DEBUG_MESHLET_CLUSTERS)
+import package::render::utils::rand_f;
+
 @if(MATERIAL_OIT_ENABLED)
 import bevy_core_pipeline::oit::draw::oit_draw;
 
@@ -86,6 +89,23 @@ fn fragment(
         out.color = vec4<f32>(pbr_input.diffuse_occlusion, pbr_input.material.base_color.a);
     } @elif(AO_DEBUG_SPECULAR_OCCLUSION) {
         out.color = vec4<f32>(vec3<f32>(pbr_input.specular_occlusion), pbr_input.material.base_color.a);
+    } @elif(AO_DEBUG_MESHLET_CLUSTERS) {
+        @if(MESHLET_MESH_MATERIAL_PASS) {
+            var rng = in.cluster_id;
+            let cluster_color = vec3<f32>(rand_f(&rng), rand_f(&rng), rand_f(&rng));
+            out.color = vec4<f32>(cluster_color, 1.0);
+        } @else {
+            let shade = 0.75 + 0.25 * saturate(dot(pbr_input.N, normalize(vec3<f32>(0.4, 1.0, 0.3))));
+            out.color = vec4<f32>(vec3<f32>(0.08, 0.09, 0.12) * shade, pbr_input.material.base_color.a);
+        }
+    } @elif(AO_DEBUG_MESHLET_TRIANGLE_DENSITY) {
+        @if(MESHLET_MESH_MATERIAL_PASS) {
+            let color = meshlet_triangle_density_color(in.triangle_area_px, in.triangle_edge_px, pbr_input.N);
+            out.color = vec4<f32>(color, 1.0);
+        } @else {
+            let shade = 0.75 + 0.25 * saturate(dot(pbr_input.N, normalize(vec3<f32>(0.4, 1.0, 0.3))));
+            out.color = vec4<f32>(vec3<f32>(0.08, 0.09, 0.12) * shade, pbr_input.material.base_color.a);
+        }
     } @else {
         if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
             out.color = apply_pbr_lighting(pbr_input);
@@ -119,4 +139,35 @@ fn fragment(
         out.color.a = min(forward_decal_info.alpha, out.color.a);
 
         return out;
+}
+
+@if(!PREPASS_PIPELINE && MESHLET_MESH_MATERIAL_PASS && AO_DEBUG_MESHLET_TRIANGLE_DENSITY)
+fn meshlet_triangle_density_color(area_px: f32, edge_px: f32, world_normal: vec3<f32>) -> vec3<f32> {
+    let log_area = log2(max(area_px, 1e-4));
+
+    let c_magenta = vec3<f32>(1.0, 0.02, 0.70); // <= 0.25 px^2 (extreme micro-poly)
+    let c_red     = vec3<f32>(0.95, 0.03, 0.02); // ~1 px^2 (sub-pixel threshold)
+    let c_yellow  = vec3<f32>(0.95, 0.65, 0.02); // ~4 px^2 (dense)
+    let c_green   = vec3<f32>(0.04, 0.65, 0.08); // ~16 px^2 (optimal)
+    let c_cyan    = vec3<f32>(0.02, 0.45, 0.78); // ~64 px^2 (coarse)
+    let c_blue    = vec3<f32>(0.02, 0.06, 0.55); // >= 256 px^2 (very large)
+
+    var color: vec3<f32>;
+    if log_area < 0.0 {
+        color = mix(c_magenta, c_red, saturate((log_area + 2.0) * 0.5));
+    } else if log_area < 2.0 {
+        color = mix(c_red, c_yellow, saturate(log_area * 0.5));
+    } else if log_area < 4.0 {
+        color = mix(c_yellow, c_green, saturate((log_area - 2.0) * 0.5));
+    } else if log_area < 6.0 {
+        color = mix(c_green, c_cyan, saturate((log_area - 4.0) * 0.5));
+    } else {
+        color = mix(c_cyan, c_blue, saturate((log_area - 6.0) * 0.5));
+    }
+
+    // Fade in subtle analytical triangle wireframe only on larger triangles (> 4 px^2)
+    let wire_fade = saturate((area_px - 4.0) / 12.0);
+    let edge_factor = mix(1.0, smoothstep(0.0, 1.1, edge_px), wire_fade * 0.55);
+    let shade = 0.82 + 0.18 * saturate(dot(world_normal, normalize(vec3<f32>(0.4, 1.0, 0.3))));
+    return color * edge_factor * shade;
 }

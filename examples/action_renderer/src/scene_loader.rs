@@ -77,6 +77,10 @@ fn default_wrap_pair() -> [String; 2] {
     ["Repeat".to_string(), "Repeat".to_string()]
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SceneMaterial {
     pub id: u32,
@@ -113,6 +117,8 @@ pub struct SceneMeshletInstance {
     pub aabb_max: [f32; 3],
     #[serde(default)]
     pub dynamic: bool,
+    #[serde(default = "default_true")]
+    pub cast_shadows: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +137,8 @@ pub struct SceneMesh3dInstance {
     pub aabb_max: [f32; 3],
     #[serde(default)]
     pub lod_distances: Vec<f32>,
+    #[serde(default = "default_true")]
+    pub cast_shadows: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -408,6 +416,7 @@ fn setup_meshlet_scene(
                 asset_path: format!("{prefix}{}", inst.mesh),
                 material: mat_handle,
                 transform: tf,
+                cast_shadows: config.shadows_enabled && inst.cast_shadows,
             });
         }
 
@@ -433,8 +442,9 @@ fn setup_meshlet_scene(
                 .materials
                 .get(inst.material_id as usize)
                 .is_some_and(|m| m.alpha_mode != "Opaque");
-            let cast_shadows =
-                config.shadows_enabled && (config.foliage_shadows || (!is_transparent && !mat_is_non_opaque));
+            let cast_shadows = config.shadows_enabled
+                && inst.cast_shadows
+                && (config.foliage_shadows || (!is_transparent && !mat_is_non_opaque));
             let acc = chunk_map.entry(inst.chunk.clone()).or_default();
             acc.expand_bounds(wmin, wmax);
             acc.mesh3ds.push(ChunkMesh3dItem {
@@ -740,6 +750,7 @@ fn setup_meshlet_scene(
                         asset_path: format!("{prefix}meshes/{fname}"),
                         material: default_mat.clone(),
                         transform: Transform::default(),
+                        cast_shadows: config.shadows_enabled,
                     });
                 }
             }

@@ -111,6 +111,10 @@ pub struct SceneMaterial {
     pub wrap_mode: [String; 2],
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Meshlet 实例描述
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneMeshletInstance {
@@ -124,6 +128,8 @@ pub struct SceneMeshletInstance {
     pub aabb_min: [f32; 3],
     pub aabb_max: [f32; 3],
     pub dynamic: bool,
+    #[serde(default = "default_true")]
+    pub cast_shadows: bool,
 }
 
 /// 标准 `Mesh3d` 多级 LOD 实例描述（植物/玻璃/半透明/剔除件）
@@ -141,6 +147,8 @@ pub struct SceneMesh3dInstance {
     pub aabb_max: [f32; 3],
     /// 各级 LOD 切换/剔除距离上限（米），例如 [18.0, 45.0, 120.0]
     pub lod_distances: Vec<f32>,
+    #[serde(default = "default_true")]
+    pub cast_shadows: bool,
 }
 
 /// 从 glTF `KHR_lights_punctual` 提取的灯光描述
@@ -185,6 +193,7 @@ struct InheritedNodeTags {
     lod_ratios: Option<String>,
     lod_dists: Option<String>,
     spawn_group: String,
+    cast_shadows: bool,
 }
 
 impl Default for InheritedNodeTags {
@@ -195,6 +204,7 @@ impl Default for InheritedNodeTags {
             lod_ratios: None,
             lod_dists: None,
             spawn_group: "default".to_string(),
+            cast_shadows: true,
         }
     }
 }
@@ -257,6 +267,8 @@ pub struct SceneExportOptions<'a> {
     pub auto_instance_min: usize,
     /// 静态逐顶点 AO 烘焙参数
     pub ao: AoBakeConfig,
+    /// 允许显式 MESH3D_LOD 保留 glTF AlphaMode::Blend（默认自动转为 Mask）
+    pub lod_keep_blend: bool,
 }
 
 struct SceneContext<'a> {
@@ -266,10 +278,10 @@ struct SceneContext<'a> {
     prim_usage_counts: HashMap<(usize, usize), usize>,
     material_map: HashMap<MaterialKey, u32>,
     materials: Vec<SceneMaterial>,
-    /// 当前活跃静态批次序号：Key = (chunk_id, material_id)
-    active_batch_seq: HashMap<(String, u32), usize>,
-    /// 静态 Meshlet 合并池：Key = (chunk_id, material_id, batch_seq)
-    static_batches: HashMap<(String, u32, usize), StaticBatch>,
+    /// 当前活跃静态批次序号：Key = (chunk_id, material_id, cast_shadows)
+    active_batch_seq: HashMap<(String, u32, bool), usize>,
+    /// 静态 Meshlet 合并池：Key = (chunk_id, material_id, cast_shadows, batch_seq)
+    static_batches: HashMap<(String, u32, bool, usize), StaticBatch>,
     /// 除 static_batches 外参与全局静态遮蔽的几何（如自动实例化静态件与不透明 Mesh3d_LOD）
     ao_occluders: AoOccluderCollector,
     /// 独立/动态 Meshlet 资产去重缓存：Key = (mesh_index, prim_index)
@@ -407,7 +419,7 @@ pub fn run_scene_export(
 
     // 3. 构建全局静态遮蔽 BVH，并为静态合并批次烘焙逐顶点 AO 后导出 MeshletMesh
     let mut final_meshlet_instances = Vec::new();
-    let mut sorted_keys: Vec<(String, u32, usize)> = ctx.static_batches.keys().cloned().collect();
+    let mut sorted_keys: Vec<(String, u32, bool, usize)> = ctx.static_batches.keys().cloned().collect();
     sorted_keys.sort();
 
     let global_ao_bvh: Option<AoBvh> = if options.ao.is_active() && !sorted_keys.is_empty() {
@@ -433,17 +445,18 @@ pub fn run_scene_export(
 
     for (idx, key) in sorted_keys.iter().enumerate() {
         let mut batch = ctx.static_batches.remove(key).unwrap();
-        let (chunk, mat_id, batch_seq) = key;
+        let (chunk, mat_id, cast_shadows, batch_seq) = key;
         let tri_count = batch.indices.len() / 3;
         if tri_count == 0 {
             continue;
         }
         println!(
-            "  -> Meshlet 批次 [{}/{}] chunk='{}' mat_id={} b={} (顶点: {}, 三角形: {})",
+            "  -> Meshlet 批次 [{}/{}] chunk='{}' mat_id={} shadow={} b={} (顶点: {}, 三角形: {})",
             idx + 1,
             sorted_keys.len(),
             chunk,
             mat_id,
+            cast_shadows,
             batch_seq,
             batch.positions.len(),
             tri_count
@@ -504,9 +517,10 @@ pub fn run_scene_export(
         })?;
 
         let safe_chunk = sanitize_filename(chunk);
+        let shadow_tag = if *cast_shadows { "" } else { "_noshadow" };
         let rel_mesh_path = format!(
-            "meshes/{}_chunk_{}_mat_{}_b{}.meshlet_mesh",
-            options.input_stem, safe_chunk, mat_id, batch_seq
+            "meshes/{}_chunk_{}_mat_{}{}_b{}.meshlet_mesh",
+            options.input_stem, safe_chunk, mat_id, shadow_tag, batch_seq
         );
         let abs_mesh_path = options.out_dir.join(&rel_mesh_path);
         save_meshlet_mesh(&meshlet_mesh, &abs_mesh_path)?;
@@ -517,7 +531,7 @@ pub fn run_scene_export(
         );
 
         final_meshlet_instances.push(SceneMeshletInstance {
-            name: format!("static_{}_mat_{}_b{}", safe_chunk, mat_id, batch_seq),
+            name: format!("static_{}_mat_{}{}_b{}", safe_chunk, mat_id, shadow_tag, batch_seq),
             chunk: chunk.clone(),
             mesh: rel_mesh_path,
             material_id: *mat_id,
@@ -527,6 +541,7 @@ pub fn run_scene_export(
             aabb_min: local_aabb_min,
             aabb_max: local_aabb_max,
             dynamic: false,
+            cast_shadows: *cast_shadows,
         });
     }
 
@@ -605,6 +620,9 @@ fn resolve_node_tags(node: &gltf::Node, parent: &InheritedNodeTags) -> Inherited
     }
     if let Some(group) = val.get("bevy_spawn_group").and_then(|v| v.as_str()) {
         out.spawn_group = group.to_string();
+    }
+    if let Some(cast_shadow) = val.get("bevy_cast_shadow").and_then(|v| v.as_bool()) {
+        out.cast_shadows = cast_shadow;
     }
     out
 }
@@ -829,7 +847,17 @@ fn visit_node(
                 continue;
             }
 
-            let mat_id = register_or_get_material(&gltf_mat, ctx);
+            let force_lod_alpha_mask = tags.bevy_tag == "MESH3D_LOD"
+                && alpha_mode == gltf::material::AlphaMode::Blend
+                && !ctx.options.lod_keep_blend;
+            if force_lod_alpha_mask {
+                println!(
+                    "  [优化] MESH3D_LOD 节点 '{}' 使用的 AlphaBlend 材质 '{}' 已自动转为 AlphaMode::Mask（避免 Transparent Pass 过绘）",
+                    node_name,
+                    gltf_mat.name().unwrap_or("unnamed")
+                );
+            }
+            let mat_id = register_or_get_material(&gltf_mat, force_lod_alpha_mask, ctx);
             let raw_normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|i| i.collect());
             let raw_uvs: Vec<[f32; 2]> = reader
                 .read_tex_coords(0)
@@ -878,7 +906,8 @@ fn visit_node(
 
             if route_to_mesh3d {
                 let effective_tag = if tags.bevy_tag == "MESH3D_TRANS"
-                    || alpha_mode == gltf::material::AlphaMode::Blend
+                    || (tags.bevy_tag != "MESH3D_LOD"
+                        && alpha_mode == gltf::material::AlphaMode::Blend)
                 {
                     "MESH3D_TRANS"
                 } else {
@@ -964,20 +993,21 @@ fn visit_node(
                     aabb_min,
                     aabb_max,
                     lod_distances,
+                    cast_shadows: tags.cast_shadows,
                 });
             } else if ctx.options.merge_by_material
                 && !is_dynamic_by_prefix
                 && tags.bevy_tag != "MESHLET_DYN"
                 && !auto_instanced
             {
-                // 合并到按 (effective_chunk, material_id, batch_seq) 分组并控制面数上限的静态 Meshlet 批次中
+                // 合并到按 (effective_chunk, material_id, cast_shadows, batch_seq) 分组并控制面数上限的静态 Meshlet 批次中
                 let prim_tris = indices.len() / 3;
                 let seq_entry = ctx
                     .active_batch_seq
-                    .entry((effective_chunk.clone(), mat_id))
+                    .entry((effective_chunk.clone(), mat_id, tags.cast_shadows))
                     .or_insert(0);
                 if ctx.options.max_batch_tris > 0 {
-                    let cur_key = (effective_chunk.clone(), mat_id, *seq_entry);
+                    let cur_key = (effective_chunk.clone(), mat_id, tags.cast_shadows, *seq_entry);
                     if let Some(existing) = ctx.static_batches.get(&cur_key) {
                         let existing_tris = existing.indices.len() / 3;
                         if existing_tris > 0 && existing_tris + prim_tris > ctx.options.max_batch_tris
@@ -986,7 +1016,7 @@ fn visit_node(
                         }
                     }
                 }
-                let batch_key = (effective_chunk, mat_id, *seq_entry);
+                let batch_key = (effective_chunk, mat_id, tags.cast_shadows, *seq_entry);
                 append_to_static_batch(
                     ctx.static_batches.entry(batch_key).or_default(),
                     world,
@@ -1073,6 +1103,7 @@ fn visit_node(
                     aabb_min,
                     aabb_max,
                     dynamic: is_dynamic_instance,
+                    cast_shadows: tags.cast_shadows,
                 });
             }
         }
@@ -1173,7 +1204,11 @@ fn gltf_wrap_to_code_and_str(mode: gltf::texture::WrappingMode) -> (u8, String) 
     }
 }
 
-fn register_or_get_material(gltf_mat: &gltf::Material, ctx: &mut SceneContext<'_>) -> u32 {
+fn register_or_get_material(
+    gltf_mat: &gltf::Material,
+    force_alpha_mask: bool,
+    ctx: &mut SceneContext<'_>,
+) -> u32 {
     let pbr = gltf_mat.pbr_metallic_roughness();
     let base_color = pbr.base_color_factor();
     let metallic = pbr.metallic_factor();
@@ -1183,7 +1218,13 @@ fn register_or_get_material(gltf_mat: &gltf::Material, ctx: &mut SceneContext<'_
     let (alpha_mode_code, alpha_mode_str) = match gltf_mat.alpha_mode() {
         gltf::material::AlphaMode::Opaque => (0u8, "Opaque".to_string()),
         gltf::material::AlphaMode::Mask => (1u8, "Mask".to_string()),
-        gltf::material::AlphaMode::Blend => (2u8, "Blend".to_string()),
+        gltf::material::AlphaMode::Blend => {
+            if force_alpha_mask {
+                (1u8, "Mask".to_string())
+            } else {
+                (2u8, "Blend".to_string())
+            }
+        }
     };
     let alpha_cutoff = gltf_mat.alpha_cutoff().unwrap_or(0.5);
 

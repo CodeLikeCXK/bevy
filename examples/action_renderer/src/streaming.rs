@@ -48,6 +48,7 @@ pub struct ChunkMeshletItem {
     pub asset_path: String,
     pub material: Handle<StandardMaterial>,
     pub transform: Transform,
+    pub cast_shadows: bool,
 }
 
 /// 挂载在已展开的 Mesh3d LOD 实体上的三角面数量元数据（供 HUD 统计，不访问已提取到 RenderWorld 的 Mesh 缓冲）
@@ -197,14 +198,15 @@ fn update_chunk_streaming(
                     .or_insert_with(|| asset_server.load(&item.asset_path))
                     .clone();
 
-                let entity = commands
-                    .spawn((
-                        MeshletMesh3d(handle),
-                        MeshMaterial3d(item.material.clone()),
-                        item.transform,
-                    ))
-                    .id();
-                chunk_ref.spawned_entities.push(entity);
+                let mut entity_cmds = commands.spawn((
+                    MeshletMesh3d(handle),
+                    MeshMaterial3d(item.material.clone()),
+                    item.transform,
+                ));
+                if !item.cast_shadows {
+                    entity_cmds.insert(NotShadowCaster);
+                }
+                chunk_ref.spawned_entities.push(entity_cmds.id());
             }
 
             chunk_ref.pending_meshlet_cursor = end;

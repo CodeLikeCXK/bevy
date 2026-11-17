@@ -32,6 +32,10 @@ struct PartialDerivatives {
     barycentrics: vec3<f32>,
     ddx: vec3<f32>,
     ddy: vec3<f32>,
+    @if(AO_DEBUG_MESHLET_TRIANGLE_DENSITY)
+    triangle_area_px: f32,
+    @if(AO_DEBUG_MESHLET_TRIANGLE_DENSITY)
+    triangle_edge_px: f32,
 }
 
 /// https://github.com/ConfettiFX/The-Forge/blob/9d43e69141a9cd0ce2ce2d2db5122234d3a2d5b5/Common_3/Renderer/VisibilityBuffer2/Shaders/FSL/vb_shading_utilities.h.fsl#L90-L150
@@ -48,7 +52,8 @@ fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_
     let ndc_1 = vertex_clip_position_1.xy * inv_w[1];
     let ndc_2 = vertex_clip_position_2.xy * inv_w[2];
 
-    let inv_det = 1.0 / determinant(mat2x2(ndc_2 - ndc_1, ndc_0 - ndc_1));
+    let det = determinant(mat2x2(ndc_2 - ndc_1, ndc_0 - ndc_1));
+    let inv_det = 1.0 / det;
     result.ddx = vec3(ndc_1.y - ndc_2.y, ndc_2.y - ndc_0.y, ndc_0.y - ndc_1.y) * inv_det * inv_w;
     result.ddy = vec3(ndc_2.x - ndc_1.x, ndc_0.x - ndc_2.x, ndc_1.x - ndc_0.x) * inv_det * inv_w;
 
@@ -78,6 +83,14 @@ fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_
 
     result.ddx = interp_ddx_w * (result.barycentrics * interp_inv_w + result.ddx) - result.barycentrics;
     result.ddy = interp_ddy_w * (result.barycentrics * interp_inv_w + result.ddy) - result.barycentrics;
+
+    @if(AO_DEBUG_MESHLET_TRIANGLE_DENSITY) {
+        result.triangle_area_px = 0.5 * abs(det) / (two_over_screen_size.x * two_over_screen_size.y);
+        let grad_len = sqrt(result.ddx * result.ddx + result.ddy * result.ddy);
+        let edge_dists = max(result.barycentrics, vec3(0.0)) / max(grad_len, vec3(1e-6));
+        result.triangle_edge_px = min(edge_dists.x, min(edge_dists.y, edge_dists.z));
+    }
+
     return result;
 }
 
@@ -94,6 +107,10 @@ struct VertexOutput {
     mesh_flags: u32,
     cluster_id: u32,
     material_bind_group_slot: u32,
+    @if(AO_DEBUG_MESHLET_TRIANGLE_DENSITY)
+    triangle_area_px: f32,
+    @if(AO_DEBUG_MESHLET_TRIANGLE_DENSITY)
+    triangle_edge_px: f32,
     @if(PREPASS_FRAGMENT && MOTION_VECTOR_PREPASS)
     motion_vector: vec2<f32>,
 }
@@ -174,6 +191,10 @@ fn resolve_vertex_output(frag_coord: vec4<f32>) -> VertexOutput {
     out.mesh_flags = instance_uniform.flags;
     out.cluster_id = instance_id ^ meshlet_id;
     out.material_bind_group_slot = instance_uniform.material_and_lightmap_bind_group_slot & 0xffffu;
+    @if(AO_DEBUG_MESHLET_TRIANGLE_DENSITY) {
+        out.triangle_area_px = partial_derivatives.triangle_area_px;
+        out.triangle_edge_px = partial_derivatives.triangle_edge_px;
+    }
     @if(PREPASS_FRAGMENT && MOTION_VECTOR_PREPASS)
     out.motion_vector = motion_vector;
     return out;

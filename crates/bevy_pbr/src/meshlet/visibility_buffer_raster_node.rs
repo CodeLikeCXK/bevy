@@ -202,12 +202,12 @@ pub fn meshlet_visibility_buffer_raster(
         meshlet_view_resources,
     ) in view_light_query.iter()
     {
-        let shadow_visibility_buffer_hardware_raster_pipeline =
-            if let LightEntity::Directional { .. } = light_type {
-                visibility_buffer_hardware_raster_shadow_view_unclipped_pipeline
-            } else {
-                visibility_buffer_hardware_raster_shadow_view_pipeline
-            };
+        let is_directional_shadow = matches!(light_type, LightEntity::Directional { .. });
+        let shadow_visibility_buffer_hardware_raster_pipeline = if is_directional_shadow {
+            visibility_buffer_hardware_raster_shadow_view_unclipped_pipeline
+        } else {
+            visibility_buffer_hardware_raster_shadow_view_pipeline
+        };
 
         ctx.command_encoder().push_debug_group(&format!(
             "meshlet_visibility_buffer_raster: {}",
@@ -251,45 +251,50 @@ pub fn meshlet_visibility_buffer_raster(
         );
         ctx.command_encoder().pop_debug_group();
 
-        meshlet_view_resources
-            .depth_pyramid
-            .downsample_depth_with_ctx(
-                "downsample_depth",
-                &mut ctx,
-                meshlet_view_resources.view_size,
-                &meshlet_view_bind_groups.downsample_depth,
-                downsample_depth_first_shadow_view_pipeline,
-                downsample_depth_second_shadow_view_pipeline,
-            );
+        // Orthographic directional shadow cascades skip occlusion culling (`should_occlusion_cull_aabb`
+        // returns false because ShadowView lacks PreviousViewData and rotates/snaps per frame),
+        // so pass 2 and HZB mip generation would process zero candidates and can be skipped safely.
+        if !is_directional_shadow {
+            meshlet_view_resources
+                .depth_pyramid
+                .downsample_depth_with_ctx(
+                    "downsample_depth",
+                    &mut ctx,
+                    meshlet_view_resources.view_size,
+                    &meshlet_view_bind_groups.downsample_depth,
+                    downsample_depth_first_shadow_view_pipeline,
+                    downsample_depth_second_shadow_view_pipeline,
+                );
 
-        ctx.command_encoder()
-            .push_debug_group("meshlet_second_pass");
-        second_cull(
-            &mut ctx,
-            meshlet_view_bind_groups,
-            meshlet_view_resources,
-            view_offset,
-            previous_view_offset,
-            second_instance_cull_pipeline,
-            second_bvh_cull_pipeline,
-            second_meshlet_cull_pipeline,
-            remap_1d_to_2d_dispatch_pipeline,
-        );
-        raster_pass(
-            false,
-            &mut ctx,
-            &meshlet_view_resources.visibility_buffer_software_raster_indirect_args,
-            &meshlet_view_resources.visibility_buffer_hardware_raster_indirect_args,
-            &meshlet_view_resources.dummy_render_target.default_view,
-            meshlet_view_bind_groups,
-            view_offset,
-            visibility_buffer_software_raster_shadow_view_pipeline,
-            shadow_visibility_buffer_hardware_raster_pipeline,
-            fill_counts_pipeline,
-            None,
-            meshlet_view_resources.rightmost_slot,
-        );
-        ctx.command_encoder().pop_debug_group();
+            ctx.command_encoder()
+                .push_debug_group("meshlet_second_pass");
+            second_cull(
+                &mut ctx,
+                meshlet_view_bind_groups,
+                meshlet_view_resources,
+                view_offset,
+                previous_view_offset,
+                second_instance_cull_pipeline,
+                second_bvh_cull_pipeline,
+                second_meshlet_cull_pipeline,
+                remap_1d_to_2d_dispatch_pipeline,
+            );
+            raster_pass(
+                false,
+                &mut ctx,
+                &meshlet_view_resources.visibility_buffer_software_raster_indirect_args,
+                &meshlet_view_resources.visibility_buffer_hardware_raster_indirect_args,
+                &meshlet_view_resources.dummy_render_target.default_view,
+                meshlet_view_bind_groups,
+                view_offset,
+                visibility_buffer_software_raster_shadow_view_pipeline,
+                shadow_visibility_buffer_hardware_raster_pipeline,
+                fill_counts_pipeline,
+                None,
+                meshlet_view_resources.rightmost_slot,
+            );
+            ctx.command_encoder().pop_debug_group();
+        }
 
         resolve_depth(
             &mut ctx,
@@ -299,16 +304,18 @@ pub fn meshlet_visibility_buffer_raster(
             camera,
             meshlet_view_resources.view_size,
         );
-        meshlet_view_resources
-            .depth_pyramid
-            .downsample_depth_with_ctx(
-                "downsample_depth",
-                &mut ctx,
-                meshlet_view_resources.view_size,
-                &meshlet_view_bind_groups.downsample_depth,
-                downsample_depth_first_shadow_view_pipeline,
-                downsample_depth_second_shadow_view_pipeline,
-            );
+        if !is_directional_shadow {
+            meshlet_view_resources
+                .depth_pyramid
+                .downsample_depth_with_ctx(
+                    "downsample_depth",
+                    &mut ctx,
+                    meshlet_view_resources.view_size,
+                    &meshlet_view_bind_groups.downsample_depth,
+                    downsample_depth_first_shadow_view_pipeline,
+                    downsample_depth_second_shadow_view_pipeline,
+                );
+        }
         ctx.command_encoder().pop_debug_group();
         time_span_shadow.end(ctx.command_encoder());
     }

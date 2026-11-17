@@ -145,6 +145,7 @@ fn toggle_hud_visibility(
 
 fn cycle_ao_debug_view(
     keys: Res<ButtonInput<KeyCode>>,
+    mut timer: ResMut<HudRefreshTimer>,
     mut cameras: Query<&mut AoDebugView, With<Camera3d>>,
 ) {
     if !keys.just_pressed(KeyCode::F4) {
@@ -154,6 +155,8 @@ fn cycle_ao_debug_view(
         *mode = mode.next();
         info!("调试视图切换为: {}", mode.label());
     }
+    let duration = timer.0.duration();
+    timer.0.set_elapsed(duration);
 }
 
 fn format_compact_count(count: usize) -> String {
@@ -300,13 +303,14 @@ fn update_hud_text(
 
     // 5. Mesh3d LOD 可见多边形统计（结合相机与 VisibilityRange 估算当前激活 LOD 面数）
     let mut cam_pos = None;
-    let mut debug_view_label = AoDebugView::Lit.label();
+    let mut debug_view = AoDebugView::Lit;
     if let Some((tf, dbg_opt)) = geom.camera_query.iter().next() {
         cam_pos = Some(tf.translation());
         if let Some(dbg) = dbg_opt {
-            debug_view_label = dbg.label();
+            debug_view = *dbg;
         }
     }
+    let debug_view_label = debug_view.label();
     let mut mesh3d_total_entities = 0usize;
     let mut mesh3d_visible_entities = 0usize;
     let mut mesh3d_visible_tris = 0usize;
@@ -345,13 +349,23 @@ fn update_hud_text(
         )
     };
 
+    let view_legend = match debug_view {
+        AoDebugView::MeshletClusters => {
+            "\nCluster View: Random color per Meshlet cluster (Mesh3d = dark gray)"
+        }
+        AoDebugView::MeshletTriangleDensity => {
+            "\nTri Area: <=0.25px2 Magenta | 1px2 Red | 4px2 Yellow | 16px2 Green | 64+px2 Blue"
+        }
+        _ => "",
+    };
+
     text.0 = format!(
         "FPS: {:.1} (avg {:.1}) | Frame: {:.1} ms | View: {}\n\
          {}\n\
          Lights: Dir {} (Shadow {}) | Local {}/{} | GI: {} | Sky: {}\n\
          Chunks: {}/{} | Meshlet: {} inst, {} clusters ({} pool tris)\n\
          Mesh3d LOD: {}/{} visible ({} tris) | Total Pool Tris: {}\n\
-         [F3] HUD  [F4] View  [Space] GI  [[ / ]] GI±  [B] Sky  [- / =] Env±",
+         [F3] HUD  [F4] View  [Space] GI  [[ / ]] GI±  [B] Sky  [- / =] Env±{}",
         fps_cur,
         fps_avg,
         frame_ms,
@@ -372,5 +386,6 @@ fn update_hud_text(
         mesh3d_total_entities,
         format_compact_count(mesh3d_visible_tris),
         format_compact_count(total_poly_estimate),
+        view_legend,
     );
 }

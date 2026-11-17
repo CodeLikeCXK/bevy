@@ -17,12 +17,14 @@ fn lod_error_is_imperceptible(lod_sphere: vec4<f32>, simplification_error: f32, 
 
     let projection = view.clip_from_view;
     if projection[3][3] == 1.0 {
-        // Orthographic
+        // Orthographic (directional shadow cascades): relax from 1.0 to 2.0 shadow texels
+        // (rotation-invariant because cascade diameter & viewport.w are independent of camera orientation,
+        // while staying within PCF kernel width to avoid silhouette popping across cascade transitions).
         let world_error = simplification_error * world_scale;
         let proj = projection[1][1];
         let height = 2.0 / proj;
         let norm_error = world_error / height;
-        return norm_error * view.viewport.w < 1.0;
+        return norm_error * view.viewport.w < 2.0;
     } else {
         // Perspective
         var near = projection[3][2];

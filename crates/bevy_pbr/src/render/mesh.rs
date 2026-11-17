@@ -367,6 +367,8 @@ pub enum AoDebugView {
     DiffuseOcclusion,
     SpecularOcclusion,
     IblSpecularOnly,
+    MeshletClusters,
+    MeshletTriangleDensity,
 }
 
 impl AoDebugView {
@@ -376,7 +378,9 @@ impl AoDebugView {
             Self::VertexAo => Self::DiffuseOcclusion,
             Self::DiffuseOcclusion => Self::SpecularOcclusion,
             Self::SpecularOcclusion => Self::IblSpecularOnly,
-            Self::IblSpecularOnly => Self::Lit,
+            Self::IblSpecularOnly => Self::MeshletClusters,
+            Self::MeshletClusters => Self::MeshletTriangleDensity,
+            Self::MeshletTriangleDensity => Self::Lit,
         }
     }
 
@@ -387,6 +391,8 @@ impl AoDebugView {
             Self::DiffuseOcclusion => "Diffuse Occlusion",
             Self::SpecularOcclusion => "Specular Occlusion",
             Self::IblSpecularOnly => "IBL Specular Only",
+            Self::MeshletClusters => "Meshlet Clusters",
+            Self::MeshletTriangleDensity => "Meshlet Tri Density",
         }
     }
 }
@@ -3220,6 +3226,8 @@ bitflags::bitflags! {
         const AO_DEBUG_DIFFUSE_OCCLUSION = 2 << Self::AO_DEBUG_SHIFT_BITS;
         const AO_DEBUG_SPECULAR_OCCLUSION = 3 << Self::AO_DEBUG_SHIFT_BITS;
         const AO_DEBUG_IBL_SPECULAR_ONLY = 4 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_MESHLET_CLUSTERS = 5 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_MESHLET_TRIANGLE_DENSITY = 6 << Self::AO_DEBUG_SHIFT_BITS;
         const ALL_RESERVED_BITS =
             Self::BLEND_RESERVED_BITS.bits() |
             Self::MSAA_RESERVED_BITS.bits() |
@@ -3272,6 +3280,8 @@ impl MeshPipelineKey {
             AoDebugView::DiffuseOcclusion => Self::AO_DEBUG_DIFFUSE_OCCLUSION,
             AoDebugView::SpecularOcclusion => Self::AO_DEBUG_SPECULAR_OCCLUSION,
             AoDebugView::IblSpecularOnly => Self::AO_DEBUG_IBL_SPECULAR_ONLY,
+            AoDebugView::MeshletClusters => Self::AO_DEBUG_MESHLET_CLUSTERS,
+            AoDebugView::MeshletTriangleDensity => Self::AO_DEBUG_MESHLET_TRIANGLE_DENSITY,
         }
     }
 
@@ -3285,6 +3295,10 @@ impl MeshPipelineKey {
             Some("AO_DEBUG_SPECULAR_OCCLUSION")
         } else if mode == Self::AO_DEBUG_IBL_SPECULAR_ONLY {
             Some("AO_DEBUG_IBL_SPECULAR_ONLY")
+        } else if mode == Self::AO_DEBUG_MESHLET_CLUSTERS {
+            Some("AO_DEBUG_MESHLET_CLUSTERS")
+        } else if mode == Self::AO_DEBUG_MESHLET_TRIANGLE_DENSITY {
+            Some("AO_DEBUG_MESHLET_TRIANGLE_DENSITY")
         } else {
             None
         }

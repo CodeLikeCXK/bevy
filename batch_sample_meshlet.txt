@@ -1,0 +1,13 @@
+cd tools\makemeshlet
+cargo run --release -- -i "C:\Users\12410\Downloads\TestMesh\sponza\scene_tagged.glb" -o "C:\Users\12410\Downloads\TestMesh\sponza\out_scene" --scene --export-textures  --max-texture-size 512  --grid-size 10.0 --max-batch-tris 250000 --auto-instance-min 3 --ao-samples 32 --ao-radius 1.5 --ao-power 1
+
+mutracer-native.exe bake --scene "C:\Users\12410\Downloads\TestMesh\sponza\scene_tagged.glb" --out "Sponza_Full_ForLight.vxgi.ktx2" --resolution 32,32,32 --spp 64 --bounces 4 -hdri "C:\Users\12410\Downloads\TestMesh\sponza\main_sponza\textures\kloppenheim_05_4k.hdr"  --hdri-intensity 1.0 --hdri-rotation 45
+
+cargo run --release --offline --manifest-path examples/action_renderer/Cargo.toml -- `
+--scene-dir "C:\Users\12410\Downloads\TestMesh\sponza\out_scene" `
+--irradiance-ktx2 "C:\bevy\assets\irradiance_volumes\Sponza_Full_ForLight.irradiance.vxgi.ktx2" `
+--irradiance-meta "C:\bevy\assets\irradiance_volumes\Sponza_Full_ForLight.irradiance.vxgi.meta.json" `
+--irradiance-intensity 150 `
+--hdri "C:\Users\12410\Downloads\TestMesh\sponza\main_sponza\textures\kloppenheim_05_4k.hdr" `
+--env-intensity 300 --skybox-brightness 1200 `
+--width 1920 --height 1080 --scale-factor 0.5 --shadow-size 512 --shadow-distance 60 --no-vsync
