@@ -11,7 +11,7 @@
 //!    输出统一的 `<stem>.meshlet_scene.json` 清单。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -23,6 +23,7 @@ use bevy_mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy_pbr::experimental::meshlet::{MeshletMesh, MeshletMeshSaver};
 use serde::{Deserialize, Serialize};
 
+use crate::ao_baker::{bake_vertex_ao, AoBakeConfig, AoBvh, AoOccluderCollector};
 use crate::lod_mesh::{
     build_mesh3d_lod_asset, parse_lod_distances, parse_lod_ratios, save_mesh3d_lod_asset,
 };
@@ -60,6 +61,28 @@ pub struct MeshletSceneManifest {
     pub lights: Vec<SceneLight>,
     pub gameplay_markers: Vec<SceneGameplayMarker>,
     pub skipped_non_opaque: Vec<SkippedPrimitiveInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_hdri: Option<SceneWorldHdri>,
+}
+
+fn default_hdri_strength() -> f32 {
+    1.0
+}
+
+fn default_hdri_projection() -> String {
+    "equirectangular".to_string()
+}
+
+/// 从 Blender World 提取的 HDRI 环境贴图配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SceneWorldHdri {
+    pub image: String,
+    #[serde(default = "default_hdri_strength")]
+    pub strength: f32,
+    #[serde(default)]
+    pub yaw_degrees: f32,
+    #[serde(default = "default_hdri_projection")]
+    pub projection: String,
 }
 
 fn default_wrap_pair() -> [String; 2] {
@@ -232,6 +255,8 @@ pub struct SceneExportOptions<'a> {
     pub max_batch_tris: usize,
     /// 同一图元出现 >= N 次时自动走局部实例化复用（0 表示禁用）
     pub auto_instance_min: usize,
+    /// 静态逐顶点 AO 烘焙参数
+    pub ao: AoBakeConfig,
 }
 
 struct SceneContext<'a> {
@@ -245,6 +270,8 @@ struct SceneContext<'a> {
     active_batch_seq: HashMap<(String, u32), usize>,
     /// 静态 Meshlet 合并池：Key = (chunk_id, material_id, batch_seq)
     static_batches: HashMap<(String, u32, usize), StaticBatch>,
+    /// 除 static_batches 外参与全局静态遮蔽的几何（如自动实例化静态件与不透明 Mesh3d_LOD）
+    ao_occluders: AoOccluderCollector,
     /// 独立/动态 Meshlet 资产去重缓存：Key = (mesh_index, prim_index)
     dynamic_assets_cache: HashMap<(usize, usize), (String, [f32; 3], [f32; 3])>,
     dynamic_instances: Vec<SceneMeshletInstance>,
@@ -331,6 +358,7 @@ pub fn run_scene_export(
         materials: Vec::new(),
         active_batch_seq: HashMap::new(),
         static_batches: HashMap::new(),
+        ao_occluders: AoOccluderCollector::default(),
         dynamic_assets_cache: HashMap::new(),
         dynamic_instances: Vec::new(),
         mesh3d_assets_cache: HashMap::new(),
@@ -377,11 +405,31 @@ pub fn run_scene_export(
         ctx.degenerate_prims_skipped
     );
 
-    // 3. 构建并保存按 (chunk, material_id, batch_seq) 切分且局部中心化后的静态 MeshletMesh
-    println!("\n[4/5] 正在构建并导出 MeshletMesh 静态分块资产...");
+    // 3. 构建全局静态遮蔽 BVH，并为静态合并批次烘焙逐顶点 AO 后导出 MeshletMesh
     let mut final_meshlet_instances = Vec::new();
     let mut sorted_keys: Vec<(String, u32, usize)> = ctx.static_batches.keys().cloned().collect();
     sorted_keys.sort();
+
+    let global_ao_bvh: Option<AoBvh> = if options.ao.is_active() && !sorted_keys.is_empty() {
+        let t_bvh = Instant::now();
+        let mut collector = std::mem::take(&mut ctx.ao_occluders);
+        for key in &sorted_keys {
+            if let Some(batch) = ctx.static_batches.get(key) {
+                collector.push_indexed_mesh(&batch.positions, &batch.indices, None);
+            }
+        }
+        let tri_total = collector.triangle_count();
+        let bvh = collector.build();
+        println!(
+            "\n[4/5] 已构建全局静态 AO BVH（{} 个遮蔽三角面，耗时 {:.2}s），正在并行烘焙逐顶点 AO 并构建 MeshletMesh...",
+            tri_total,
+            t_bvh.elapsed().as_secs_f64()
+        );
+        Some(bvh)
+    } else {
+        println!("\n[4/5] 正在构建并导出 MeshletMesh 静态分块资产...");
+        None
+    };
 
     for (idx, key) in sorted_keys.iter().enumerate() {
         let mut batch = ctx.static_batches.remove(key).unwrap();
@@ -400,6 +448,21 @@ pub fn run_scene_export(
             batch.positions.len(),
             tri_count
         );
+
+        // 先在世界空间（与 global_ao_bvh 同坐标系）烘焙静态逐顶点 AO
+        let vertex_ao = global_ao_bvh.as_ref().map(|bvh| {
+            let t_ao = Instant::now();
+            let ao = bake_vertex_ao(bvh, &batch.positions, &batch.normals, options.ao);
+            let min_ao = ao.iter().copied().fold(1.0f32, f32::min);
+            let avg_ao = ao.iter().sum::<f32>() / ao.len().max(1) as f32;
+            println!(
+                "     [AO] 耗时 {:.2}s (avg={:.3}, min={:.3})",
+                t_ao.elapsed().as_secs_f64(),
+                avg_ao,
+                min_ao
+            );
+            ao
+        });
 
         // 将世界合并坐标平移至批次自身 AABB 中心附近，减小定点量化误差并保证紧凑局部包围盒
         let batch_center =
@@ -428,7 +491,12 @@ pub fn run_scene_export(
         bevy_mesh.insert_indices(Indices::U32(batch.indices));
 
         let t0 = Instant::now();
-        let meshlet_mesh = MeshletMesh::from_mesh(&bevy_mesh, options.quantization).map_err(|e| {
+        let meshlet_mesh = MeshletMesh::from_mesh_with_ao(
+            &bevy_mesh,
+            options.quantization,
+            vertex_ao.as_deref(),
+        )
+        .map_err(|e| {
             format!(
                 "静态批次 chunk='{}' mat_id={} b={} 构建 Meshlet 失败: {:?}",
                 chunk, mat_id, batch_seq, e
@@ -464,7 +532,10 @@ pub fn run_scene_export(
 
     final_meshlet_instances.extend(ctx.dynamic_instances);
 
-    // 4. 写入场景清单 JSON
+    // 4. 提取场景 World HDRI 配置（优先读取 glTF scene.extras，其次读旁路 .bevy_hdri.json）并随场景打包
+    let world_hdri = extract_and_bundle_world_hdri(&document, options);
+
+    // 5. 写入场景清单 JSON
     println!("\n[5/5] 正在生成场景清单 (.meshlet_scene.json)...");
     let manifest = MeshletSceneManifest {
         version: 2,
@@ -480,6 +551,7 @@ pub fn run_scene_export(
         lights: ctx.lights,
         gameplay_markers: ctx.gameplay_markers,
         skipped_non_opaque: ctx.skipped_non_opaque,
+        world_hdri,
     };
 
     let manifest_path = options
@@ -496,6 +568,12 @@ pub fn run_scene_export(
     println!("  去重材质总数: {}", manifest.materials.len());
     println!("  提取灯光总数: {}", manifest.lights.len());
     println!("  Gameplay 标记点数: {}", manifest.gameplay_markers.len());
+    if let Some(hdri) = &manifest.world_hdri {
+        println!(
+            "  World HDRI: {} (strength={:.2}, yaw={:.1}°)",
+            hdri.image, hdri.strength, hdri.yaw_degrees
+        );
+    }
     println!("=======================================================");
 
     Ok(())
@@ -826,6 +904,15 @@ fn visit_node(
                     .collect::<Vec<_>>()
                     .join("_");
 
+                if ctx.options.ao.is_active()
+                    && alpha_mode == gltf::material::AlphaMode::Opaque
+                    && !is_dynamic_by_prefix
+                    && tags.bevy_tag != "MESHLET_DYN"
+                {
+                    ctx.ao_occluders
+                        .push_indexed_mesh(&positions, &indices, Some(&world));
+                }
+
                 let cache_key = (mesh.index(), prim_idx, ratios_sig.clone());
                 let (rel_mesh_path, aabb_min, aabb_max) =
                     if let Some(cached) = ctx.mesh3d_assets_cache.get(&cache_key) {
@@ -914,32 +1001,51 @@ fn visit_node(
                 if auto_instanced {
                     ctx.auto_instanced_count += 1;
                 }
+                let is_dynamic_instance = is_dynamic_by_prefix || tags.bevy_tag == "MESHLET_DYN";
+                if ctx.options.ao.is_active() && !is_dynamic_instance {
+                    ctx.ao_occluders
+                        .push_indexed_mesh(&positions, &indices, Some(&world));
+                }
                 let key = (mesh.index(), prim_idx);
                 let (rel_mesh_path, aabb_min, aabb_max) =
                     if let Some(cached) = ctx.dynamic_assets_cache.get(&key) {
                         cached.clone()
                     } else {
                         let (aabb_min, aabb_max) = compute_local_aabb(&positions);
+                        let local_normals =
+                            ensure_local_normals(&positions, normals.as_deref(), &indices);
+
+                        // 独立/动态/实例化资产被多个位置或动态节点复用，因此仅烘焙局部自身遮蔽 AO
+                        let local_ao = if ctx.options.ao.is_active() {
+                            let local_bvh = AoBvh::from_indexed_mesh(&positions, &indices);
+                            Some(bake_vertex_ao(
+                                &local_bvh,
+                                &positions,
+                                &local_normals,
+                                ctx.options.ao,
+                            ))
+                        } else {
+                            None
+                        };
+
                         let mut bevy_mesh =
                             Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
                         bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-                        if let Some(n) = normals {
-                            bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n);
-                        } else {
-                            bevy_mesh.compute_smooth_normals();
-                        }
+                        bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, local_normals);
                         bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
                         bevy_mesh.insert_indices(Indices::U32(indices));
 
-                        let meshlet_mesh =
-                            MeshletMesh::from_mesh(&bevy_mesh, ctx.options.quantization).map_err(
-                                |e| {
-                                    format!(
-                                        "独立图元 {}_{} 构建 Meshlet 失败: {:?}",
-                                        mesh_name, prim_idx, e
-                                    )
-                                },
-                            )?;
+                        let meshlet_mesh = MeshletMesh::from_mesh_with_ao(
+                            &bevy_mesh,
+                            ctx.options.quantization,
+                            local_ao.as_deref(),
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "独立图元 {}_{} 构建 Meshlet 失败: {:?}",
+                                mesh_name, prim_idx, e
+                            )
+                        })?;
 
                         let rel_path = format!(
                             "meshes/{}_mesh_{}_prim_{}.meshlet_mesh",
@@ -966,7 +1072,7 @@ fn visit_node(
                     scale: scale.to_array(),
                     aabb_min,
                     aabb_max,
-                    dynamic: is_dynamic_by_prefix || tags.bevy_tag == "MESHLET_DYN",
+                    dynamic: is_dynamic_instance,
                 });
             }
         }
@@ -1303,4 +1409,69 @@ fn save_gltf_image_as_png(
 
     final_img.save_with_format(out_path, image::ImageFormat::Png)?;
     Ok(resized)
+}
+
+fn parse_world_hdri_from_scene_extras(scene: &gltf::Scene) -> Option<SceneWorldHdri> {
+    let extras = scene.extras().as_ref()?;
+    let val: serde_json::Value = serde_json::from_str(extras.get()).ok()?;
+    let hdri_val = val.get("bevy_world_hdri")?;
+    if let Some(raw_json) = hdri_val.as_str() {
+        serde_json::from_str::<SceneWorldHdri>(raw_json).ok()
+    } else {
+        serde_json::from_value::<SceneWorldHdri>(hdri_val.clone()).ok()
+    }
+}
+
+fn extract_and_bundle_world_hdri(
+    document: &gltf::Document,
+    options: &SceneExportOptions,
+) -> Option<SceneWorldHdri> {
+    let mut cfg = document
+        .default_scene()
+        .and_then(|s| parse_world_hdri_from_scene_extras(&s))
+        .or_else(|| {
+            document
+                .scenes()
+                .find_map(|s| parse_world_hdri_from_scene_extras(&s))
+        });
+
+    if cfg.is_none() {
+        let sidecar = options
+            .input
+            .with_file_name(format!("{}.bevy_hdri.json", options.input_stem));
+        if sidecar.is_file()
+            && let Ok(bytes) = std::fs::read(&sidecar)
+        {
+            cfg = serde_json::from_slice::<SceneWorldHdri>(&bytes).ok();
+        }
+    }
+
+    let mut cfg = cfg?;
+    let src_path = PathBuf::from(&cfg.image);
+    let resolved_src = if src_path.is_file() {
+        Some(src_path)
+    } else if let Some(parent) = options.input.parent() {
+        let rel = parent.join(&cfg.image);
+        rel.is_file().then_some(rel)
+    } else {
+        None
+    };
+
+    if let Some(src) = resolved_src
+        && let Some(file_name) = src.file_name().and_then(|n| n.to_str())
+    {
+        let env_dir = options.out_dir.join("environment");
+        if std::fs::create_dir_all(&env_dir).is_ok() {
+            let safe_name = sanitize_filename(file_name);
+            let dst = env_dir.join(&safe_name);
+            if std::fs::copy(&src, &dst).is_ok() {
+                cfg.image = format!("environment/{safe_name}");
+                println!("  -> 已打包 World HDRI: {}", cfg.image);
+                return Some(cfg);
+            }
+        }
+    }
+
+    println!("  -> 记录 World HDRI 路径: {}", cfg.image);
+    Some(cfg)
 }

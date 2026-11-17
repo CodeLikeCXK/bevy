@@ -79,17 +79,25 @@ fn fragment(
     // in deferred mode the lit color and these effects will be calculated in the deferred lighting shader
 @if(!PREPASS_PIPELINE)
     var out: FragmentOutput;
-@if(!PREPASS_PIPELINE)
-    if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
-        out.color = apply_pbr_lighting(pbr_input);
-    } else {
-        out.color = pbr_input.material.base_color;
-    }
+@if(!PREPASS_PIPELINE) {
+    @if(AO_DEBUG_VERTEX_AO) {
+        out.color = vec4<f32>(vec3<f32>(pbr_input.vertex_ao), pbr_input.material.base_color.a);
+    } @elif(AO_DEBUG_DIFFUSE_OCCLUSION) {
+        out.color = vec4<f32>(pbr_input.diffuse_occlusion, pbr_input.material.base_color.a);
+    } @elif(AO_DEBUG_SPECULAR_OCCLUSION) {
+        out.color = vec4<f32>(vec3<f32>(pbr_input.specular_occlusion), pbr_input.material.base_color.a);
+    } @else {
+        if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
+            out.color = apply_pbr_lighting(pbr_input);
+        } else {
+            out.color = pbr_input.material.base_color;
+        }
 
-    // apply in-shader post processing (fog, alpha-premultiply, and also tonemapping, debanding if the camera is non-hdr)
-    // note this does not include fullscreen postprocessing effects like bloom.
-@if(!PREPASS_PIPELINE)
-    out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+        // apply in-shader post processing (fog, alpha-premultiply, and also tonemapping, debanding if the camera is non-hdr)
+        // note this does not include fullscreen postprocessing effects like bloom.
+        out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    }
+}
 
 @if(MATERIAL_OIT_ENABLED) {
     let alpha_mode = pbr_input.material.flags & pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS;

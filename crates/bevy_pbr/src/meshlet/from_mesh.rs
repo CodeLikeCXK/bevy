@@ -65,11 +65,29 @@ impl MeshletMesh {
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        Self::from_mesh_with_ao(mesh, vertex_position_quantization_factor, None)
+    }
+
+    /// Process a [`Mesh`] along with optional per-vertex static ambient occlusion (`0.0..=1.0`)
+    /// to generate a [`MeshletMesh`].
+    pub fn from_mesh_with_ao(
+        mesh: &Mesh,
+        vertex_position_quantization_factor: u8,
+        vertex_ao: Option<&[f32]>,
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
         let s = debug_span!("build meshlet mesh");
         let _e = s.enter();
 
         // Validate mesh format
         let indices = validate_input_mesh(mesh)?;
+        if let Some(ao) = vertex_ao
+            && ao.len() != mesh.count_vertices()
+        {
+            return Err(MeshToMeshletMeshConversionError::InvalidVertexAoLength {
+                expected: mesh.count_vertices(),
+                actual: ao.len(),
+            });
+        }
 
         // Get meshlet vertices
         let vertex_buffer = mesh.create_packed_vertex_buffer_data();
@@ -214,6 +232,7 @@ impl MeshletMesh {
                 meshlets.get(i).vertices,
                 &vertex_buffer,
                 vertex_stride,
+                vertex_ao,
                 &mut vertex_positions,
                 &mut vertex_normals,
                 &mut vertex_uvs,
@@ -588,6 +607,7 @@ fn build_and_compress_per_meshlet_vertex_data(
     meshlet_vertex_ids: &[u32],
     vertex_buffer: &[u8],
     vertex_stride: usize,
+    vertex_ao: Option<&[f32]>,
     vertex_positions: &mut BitVec<u32, Lsb0>,
     vertex_normals: &mut Vec<u32>,
     vertex_uvs: &mut Vec<Vec2>,
@@ -616,8 +636,9 @@ fn build_and_compress_per_meshlet_vertex_data(
         // Copy uncompressed UV
         vertex_uvs.push(uv);
 
-        // Compress normal
-        vertex_normals.push(pack2x16snorm(octahedral_encode(normal)));
+        // Compress octahedral normal (2x12-bit) + static vertex AO (8-bit) into u32
+        let ao = vertex_ao.map_or(1.0, |aos| aos[*vertex_id as usize]);
+        vertex_normals.push(pack_normal_and_ao(octahedral_encode(normal), ao));
 
         // Quantize position to a fixed-point IVec3
         let quantized_position = (position * quantization_factor + 0.5).as_ivec3();
@@ -1074,7 +1095,11 @@ fn sphere_to_meshlet(sphere: BoundingSphere) -> MeshletBoundingSphere {
 
 // TODO: Precise encode variant
 fn octahedral_encode(v: Vec3) -> Vec2 {
-    let n = v / (v.x.abs() + v.y.abs() + v.z.abs());
+    let denom = v.x.abs() + v.y.abs() + v.z.abs();
+    if denom < 1e-12 || !denom.is_finite() {
+        return Vec2::ZERO;
+    }
+    let n = v / denom;
     let octahedral_wrap = (1.0 - n.yx().abs())
         * Vec2::new(
             if n.x >= 0.0 { 1.0 } else { -1.0 },
@@ -1087,11 +1112,13 @@ fn octahedral_encode(v: Vec3) -> Vec2 {
     }
 }
 
-// https://www.w3.org/TR/WGSL/#pack2x16snorm-builtin
-fn pack2x16snorm(v: Vec2) -> u32 {
-    let v = v.clamp(Vec2::NEG_ONE, Vec2::ONE);
-    let v = (v * 32767.0 + 0.5).floor().as_i16vec2();
-    bytemuck::cast(v)
+/// Packs 2x12-bit octahedral normal (`[-1, 1]` mapped to `[0, 4094]` so `0.0` is exact)
+/// and 8-bit unsigned normalized static AO (`[0, 255]`) into a single `u32`.
+fn pack_normal_and_ao(oct: Vec2, ao: f32) -> u32 {
+    let qx = ((oct.x.clamp(-1.0, 1.0) * 2047.0).round() as i32 + 2047).clamp(0, 4094) as u32;
+    let qy = ((oct.y.clamp(-1.0, 1.0) * 2047.0).round() as i32 + 2047).clamp(0, 4094) as u32;
+    let qao = (ao.clamp(0.0, 1.0) * 255.0).round() as u32;
+    qx | (qy << 12) | (qao << 24)
 }
 
 /// An error produced by [`MeshletMesh::from_mesh`].
@@ -1106,4 +1133,35 @@ pub enum MeshToMeshletMeshConversionError {
     },
     #[error("Mesh has no indices")]
     MeshMissingIndices,
+    #[error("Vertex AO slice length mismatch: expected {expected}, got {actual}")]
+    InvalidVertexAoLength { expected: usize, actual: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pack_normal_and_ao_roundtrip() {
+        let normals = [
+            Vec3::X,
+            Vec3::Y,
+            Vec3::Z,
+            Vec3::NEG_X,
+            Vec3::NEG_Y,
+            Vec3::NEG_Z,
+            Vec3::new(0.4, 0.7, -0.5).normalize(),
+        ];
+        let aos = [0.0, 0.25, 0.5, 0.75, 1.0, 0.125, 0.875];
+        for (n, ao) in normals.into_iter().zip(aos) {
+            let oct = octahedral_encode(n);
+            let packed = pack_normal_and_ao(oct, ao);
+            let oct_x = ((packed & 0xFFF) as f32 - 2047.0) / 2047.0;
+            let oct_y = (((packed >> 12) & 0xFFF) as f32 - 2047.0) / 2047.0;
+            let decoded_ao = ((packed >> 24) & 0xFF) as f32 / 255.0;
+            assert!((oct_x - oct.x).abs() <= 1e-3);
+            assert!((oct_y - oct.y).abs() <= 1e-3);
+            assert!((decoded_ao - ao).abs() <= 1.0 / 255.0 + 1e-5);
+        }
+    }
 }

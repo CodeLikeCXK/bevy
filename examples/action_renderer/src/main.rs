@@ -3,6 +3,7 @@ mod hud;
 mod irradiance;
 mod lod_loader;
 mod scene_loader;
+mod skybox;
 mod streaming;
 
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use bevy::{
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     image::{ImageAddressMode, ImagePlugin, ImageSamplerDescriptor},
     light::DirectionalLightShadowMap,
-    pbr::experimental::meshlet::MeshletPlugin,
+    pbr::{experimental::meshlet::MeshletPlugin, AoDebugView},
     post_process::bloom::Bloom,
     prelude::*,
     render::{
@@ -30,7 +31,8 @@ use character_stub::CharacterActionStubPlugin;
 use hud::HudPlugin;
 use irradiance::{IrradianceConfig, IrradianceScenePlugin};
 use lod_loader::Mesh3dLodPlugin;
-use scene_loader::{MeshletSceneConfig, MeshletScenePlugin};
+use scene_loader::{find_manifest_path, MeshletSceneConfig, MeshletSceneManifest, MeshletScenePlugin, SceneWorldHdri};
+use skybox::{SkyboxConfig, SkyboxScenePlugin};
 use streaming::{StreamingConfig, StreamingPlugin};
 
 #[derive(Parser, Debug)]
@@ -151,6 +153,38 @@ struct Cli {
     /// 当场景清单中的 Point/Spot 灯光导出强度 <= 0.01（如 Power=0.000）时的兜底流明 (lumens)
     #[arg(long, default_value_t = 1600.0)]
     default_point_lumens: f32,
+
+    /// 天空盒 / HDRI 贴图路径（支持 Cubemap .ktx2 / 6层拼接图 / 2:1 等距柱状 .hdr/.exr；未指定时自动读取场景导出的 World HDRI）
+    #[arg(long, visible_alias = "hdri")]
+    skybox: Option<String>,
+
+    /// 可选预烘培 Diffuse 环境光 Cubemap (.ktx2)；配合 --env-specular 可跳过运行时 IBL 卷积
+    #[arg(long)]
+    env_diffuse: Option<String>,
+
+    /// 可选预烘培 Specular 环境光 Cubemap (.ktx2)；配合 --env-diffuse 可跳过运行时 IBL 卷积
+    #[arg(long)]
+    env_specular: Option<String>,
+
+    /// 当输入为 2:1 等距柱状 HDRI 时展开的 Cubemap 单面尺寸（2 的幂，默认 512）
+    #[arg(long, default_value_t = 512)]
+    skybox_cubemap_size: u32,
+
+    /// 天空盒背景亮度 (cd/m^2；未指定时按场景 HDRI strength 自动缩放，默认约 1500)
+    #[arg(long)]
+    skybox_brightness: Option<f32>,
+
+    /// HDRI 环境反射/漫反射强度 (cd/m^2；未指定时默认 150~250)
+    #[arg(long)]
+    env_intensity: Option<f32>,
+
+    /// 天空盒与环境光绕世界 Y 轴旋转角度（度；未指定时读取场景清单或 0）
+    #[arg(long)]
+    skybox_yaw: Option<f32>,
+
+    /// 禁用天空盒显示与场景清单自动加载 HDRI（仅保留默认占位环境光）
+    #[arg(long, default_value_t = false)]
+    no_skybox: bool,
 }
 
 #[derive(Resource, Clone)]
@@ -198,6 +232,27 @@ fn resolve_external_asset_source(app: &mut App, raw_path: &str, source_name: &st
     raw_path.to_string()
 }
 
+fn peek_manifest_world_hdri(scene_dir: &Path, manifest_file: Option<&str>) -> Option<SceneWorldHdri> {
+    let manifest_path = find_manifest_path(scene_dir, manifest_file)?;
+    let bytes = std::fs::read(manifest_path).ok()?;
+    let manifest: MeshletSceneManifest = serde_json::from_slice(&bytes).ok()?;
+    manifest.world_hdri
+}
+
+/// 优先解析为 `meshlet_scene://` 相对路径，其次通过外部文件源或内置 `assets/` 加载
+fn resolve_scene_or_external_asset(
+    app: &mut App,
+    scene_dir: &Path,
+    raw_path: &str,
+    source_name: &str,
+) -> String {
+    let norm = raw_path.replace('\\', "/");
+    if !Path::new(raw_path).is_absolute() && scene_dir.join(&norm).is_file() {
+        return format!("meshlet_scene://{norm}");
+    }
+    resolve_external_asset_source(app, raw_path, source_name)
+}
+
 fn main() {
     let cli = Cli::parse();
     let bevy_assets_dir = resolve_bevy_assets_dir();
@@ -213,6 +268,53 @@ fn main() {
         resolve_external_asset_source(&mut app, &cli.irradiance_ktx2, "irradiance_ktx2_src");
     let meta_asset_path =
         resolve_external_asset_source(&mut app, &cli.irradiance_meta, "irradiance_meta_src");
+
+    let manifest_hdri = if cli.no_skybox {
+        None
+    } else {
+        peek_manifest_world_hdri(&cli.scene_dir, cli.manifest.as_deref())
+    };
+    let raw_skybox_path = if cli.no_skybox {
+        None
+    } else {
+        cli.skybox
+            .clone()
+            .or_else(|| manifest_hdri.as_ref().map(|h| h.image.clone()))
+    };
+    let skybox_asset = raw_skybox_path.as_deref().map(|p| {
+        resolve_scene_or_external_asset(&mut app, &cli.scene_dir, p, "skybox_hdri_src")
+    });
+    let env_diffuse_asset = cli.env_diffuse.as_deref().map(|p| {
+        resolve_scene_or_external_asset(&mut app, &cli.scene_dir, p, "env_diffuse_src")
+    });
+    let env_specular_asset = cli.env_specular.as_deref().map(|p| {
+        resolve_scene_or_external_asset(&mut app, &cli.scene_dir, p, "env_specular_src")
+    });
+    let manifest_strength = manifest_hdri.as_ref().map_or(1.0, |h| h.strength);
+    let skybox_brightness = cli
+        .skybox_brightness
+        .unwrap_or(1500.0 * manifest_strength);
+    let env_intensity = cli.env_intensity.unwrap_or(
+        if skybox_asset.is_some() || (env_diffuse_asset.is_some() && env_specular_asset.is_some())
+        {
+            250.0 * manifest_strength
+        } else {
+            150.0
+        },
+    );
+    let yaw_degrees = cli
+        .skybox_yaw
+        .unwrap_or_else(|| manifest_hdri.as_ref().map_or(0.0, |h| h.yaw_degrees));
+    let skybox_config = SkyboxConfig {
+        skybox_asset,
+        env_diffuse_asset,
+        env_specular_asset,
+        cubemap_size: cli.skybox_cubemap_size,
+        skybox_brightness,
+        env_intensity,
+        yaw_degrees,
+        enabled: !cli.no_skybox,
+    };
 
     let shadows_enabled = cli.shadow_size > 0;
     let shadow_map_size = if shadows_enabled {
@@ -259,6 +361,7 @@ fn main() {
         meta_asset_path,
         intensity: cli.irradiance_intensity,
     })
+    .insert_resource(skybox_config)
     .insert_resource(StreamingConfig {
         enabled: !cli.no_streaming,
         load_distance: cli.load_distance,
@@ -308,6 +411,7 @@ fn main() {
             MeshletScenePlugin,
             Mesh3dLodPlugin,
             IrradianceScenePlugin,
+            SkyboxScenePlugin,
             StreamingPlugin,
             CharacterActionStubPlugin,
             HudPlugin,
@@ -324,6 +428,7 @@ fn setup_camera(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     render_opts: Res<RenderOptions>,
+    skybox_config: Res<SkyboxConfig>,
 ) {
     let mut cam = commands.spawn((
         Camera3d::default(),
@@ -331,10 +436,11 @@ fn setup_camera(
         // MeshletPlugin 强制要求关闭 MSAA；保留 FXAA 避免触发 Bevy 主干 meshlet_prepass 的 bind_group 槽位 bug
         Msaa::Off,
         Fxaa::default(),
+        AoDebugView::default(),
         EnvironmentMapLight {
             diffuse_map: asset_server.load("environment_maps/pisa_diffuse_rgb9e5_zstd.ktx2"),
             specular_map: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
-            intensity: 150.0,
+            intensity: skybox_config.env_intensity,
             ..default()
         },
         FreeCamera::default(),

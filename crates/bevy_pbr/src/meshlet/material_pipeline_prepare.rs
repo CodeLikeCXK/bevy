@@ -65,6 +65,7 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
             Option<&Projection>,
             Has<RenderViewLightProbes<EnvironmentMapLight>>,
             Has<RenderViewLightProbes<IrradianceVolume>>,
+            Option<&AoDebugView>,
         ),
         With<Camera3d>,
     >,
@@ -84,6 +85,7 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
         projection,
         has_environment_maps,
         has_irradiance_volumes,
+        ao_debug_view,
     ) in &mut views
     {
         let mut view_key = MeshPipelineKey::from_msaa_samples(1)
@@ -150,6 +152,9 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
         }
         if distance_fog {
             view_key |= MeshPipelineKey::DISTANCE_FOG;
+        }
+        if let Some(ao_debug) = ao_debug_view {
+            view_key |= MeshPipelineKey::from_ao_debug_view(*ao_debug);
         }
 
         view_key |= MeshPipelineKey::from_primitive_topology_and_strip_index(

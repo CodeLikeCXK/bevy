@@ -95,7 +95,14 @@ impl Plugin for IrradianceScenePlugin {
         app.init_asset::<IrradianceVolumeMeta>()
             .init_asset_loader::<IrradianceVolumeMetaLoader>()
             .add_systems(Startup, load_irradiance_assets)
-            .add_systems(Update, (spawn_irradiance_when_ready, toggle_irradiance_volume));
+            .add_systems(
+                Update,
+                (
+                    spawn_irradiance_when_ready,
+                    toggle_irradiance_volume,
+                    adjust_irradiance_intensity,
+                ),
+            );
     }
 }
 
@@ -183,4 +190,30 @@ fn toggle_irradiance_volume(
         }
         info!("IrradianceVolume: OFF");
     }
+}
+
+/// 运行时按 `[` / `]` 实时微调 VXGI 强度，便于直观标定天光 + GI 的协同比例。
+fn adjust_irradiance_intensity(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut config: ResMut<IrradianceConfig>,
+    mut volumes: Query<&mut IrradianceVolume>,
+) {
+    let down = keys.just_pressed(KeyCode::BracketLeft);
+    let up = keys.just_pressed(KeyCode::BracketRight);
+    if down == up {
+        return;
+    }
+
+    let scaled = if up {
+        (config.intensity / 0.85).max(config.intensity + 50.0)
+    } else {
+        (config.intensity * 0.85).min(config.intensity - 50.0)
+    };
+    let step = if scaled >= 1000.0 { 50.0 } else { 25.0 };
+    config.intensity = ((scaled / step).round() * step).clamp(50.0, 20000.0);
+
+    for mut volume in &mut volumes {
+        volume.intensity = config.intensity;
+    }
+    info!("IrradianceVolume 强度调整为: {:.0}", config.intensity);
 }

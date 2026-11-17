@@ -692,7 +692,12 @@ fn apply_pbr_lighting(
     // example, both lightmaps and irradiance volumes are present.
 
     var indirect_light = vec3(0.0f);
+    var debug_ibl_specular = vec3(0.0f);
     var found_diffuse_indirect = false;
+    var vxgi_weight = 0.0f;
+    var vxgi_sky_openness = 1.0f;
+    var vxgi_diffuse = vec3(0.0f);
+    var vxgi_coop_weight = 1.0f;
 
 @if(LIGHTMAP) {
     indirect_light += in.lightmap_light * diffuse_color;
@@ -702,13 +707,23 @@ fn apply_pbr_lighting(
     @if(IRRADIANCE_VOLUME)
     // Irradiance volume light (indirect)
     if (!found_diffuse_indirect) {
-        let irradiance_volume_light = irradiance_volume::irradiance_volume_light(
+        let vxgi = irradiance_volume::irradiance_volume_sample(
             in.world_position.xyz,
             in.N,
             &clusterable_object_index_ranges,
         );
-        indirect_light += irradiance_volume_light * diffuse_color * diffuse_occlusion;
-        found_diffuse_indirect = true;
+        vxgi_weight = vxgi.weight;
+        vxgi_sky_openness = vxgi.sky_openness;
+
+        // Preserve and subtly enrich indirect color bleed while grounding flat isotropic fog.
+        let vxgi_raw = vxgi.irradiance * diffuse_color;
+        let vxgi_luma = dot(vxgi_raw, vec3<f32>(0.2126f, 0.7152f, 0.0722f));
+        let vxgi_vivid = max(
+            vec3<f32>(0.0f),
+            vec3<f32>(vxgi_luma) + (vxgi_raw - vec3<f32>(vxgi_luma)) * 1.25f,
+        );
+        let vxgi_grounding = mix(0.72f, 1.0f, vxgi.directional_contrast);
+        vxgi_diffuse = vxgi_vivid * vxgi_grounding * diffuse_occlusion;
     }
 
     // Environment map light (indirect)
@@ -738,11 +753,34 @@ fn apply_pbr_lighting(
         found_diffuse_indirect,
     );
 
-    indirect_light += environment_light.diffuse * diffuse_occlusion;
+    // Cooperative sky + VXGI division of labor:
+    // - Upward faces in sky-open regions keep strong HDRI sky directionality.
+    // - Covered interiors / downward surfaces attenuate sky diffuse down to 0.08..0.22 so
+    //   VXGI carries the secondary bounce without double-lifting shadows into gray haze.
+    let normal_sky_factor = saturate(in.N.y * 0.5f + 0.5f);
+    let sky_exposure_proxy = mix(0.18f, 1.0f, vxgi_sky_openness) * mix(0.18f, 1.0f, normal_sky_factor);
+    let sky_diffuse_weight = mix(1.0f, clamp(sky_exposure_proxy, 0.08f, 0.92f), vxgi_weight);
+    let sky_diffuse = environment_light.diffuse * sky_diffuse_weight * diffuse_occlusion;
+
+    // Balance VXGI contribution where HDRI sky diffuse already dominates so the two don't stack
+    // linearly into washout on open upward-facing surfaces.
+    let coop_luma_weights = vec3<f32>(0.2126f, 0.7152f, 0.0722f);
+    let sky_luma = dot(sky_diffuse, coop_luma_weights);
+    let vxgi_luma_scaled = dot(vxgi_diffuse, coop_luma_weights);
+    let sky_share = saturate(sky_luma / max(sky_luma + vxgi_luma_scaled, 1e-4f));
+    vxgi_coop_weight = mix(1.0f, mix(0.95f, 0.52f, sky_diffuse_weight * sky_share), vxgi_weight);
+
+    indirect_light += sky_diffuse;
     if (!use_ssr) {
-        indirect_light += environment_light.specular * specular_occlusion;
+        let ibl_spec = environment_light.specular * specular_occlusion;
+        indirect_light += ibl_spec;
+        @if(AO_DEBUG_IBL_SPECULAR_ONLY) {
+            debug_ibl_specular = ibl_spec;
+        }
     }
 }
+
+    indirect_light += vxgi_diffuse * vxgi_coop_weight;
 
     // Ambient light (indirect)
     // If we are lightmapped, disable the ambient contribution if requested.
@@ -845,11 +883,15 @@ fn apply_pbr_lighting(
     }
 }
 
-    // Total light
-    output_color = vec4<f32>(
-        (view_bindings::view.exposure * (transmitted_light + direct_light + indirect_light)) + emissive_light,
-        output_color.a
-    );
+    @if(AO_DEBUG_IBL_SPECULAR_ONLY) {
+        output_color = vec4<f32>(view_bindings::view.exposure * debug_ibl_specular, output_color.a);
+    } @else {
+        // Total light
+        output_color = vec4<f32>(
+            (view_bindings::view.exposure * (transmitted_light + direct_light + indirect_light)) + emissive_light,
+            output_color.a
+        );
+    }
 
     output_color = clustering::cluster_debug_visualization(
         output_color,

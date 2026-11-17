@@ -99,6 +99,7 @@ struct PbrInput {
     diffuse_occlusion: vec3<f32>,
     /// Note: this is 1.0 (entirely unoccluded) when SSAO and SSR are off.
     specular_occlusion: f32,
+    vertex_ao: f32,
     frag_coord: vec4<f32>,
     world_position: vec4<f32>,
     /// Normalized world normal used for shadow mapping as normal-mapping is not used for shadow
@@ -131,6 +132,7 @@ fn pbr_input_new() -> PbrInput {
     pbr_input.diffuse_occlusion = vec3<f32>(1.0);
     // If SSAO is enabled, then this gets overwritten with proper specular occlusion. If its not, then we get specular environment map unoccluded (we have no data with which to occlude it with).
     pbr_input.specular_occlusion = 1.0;
+    pbr_input.vertex_ao = 1.0;
 
     pbr_input.frag_coord = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     pbr_input.world_position = vec4<f32>(0.0, 0.0, 0.0, 1.0);

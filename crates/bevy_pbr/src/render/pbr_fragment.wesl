@@ -534,15 +534,25 @@ pbr_input.material.uv_transform = uv_transform;
             @else
             diffuse_occlusion *= textureSampleBias(texture, sampler_, coords, bias.mip_bias).r;
         }
+@if(MESHLET_MESH_MATERIAL_PASS) {
+        pbr_input.vertex_ao = in.vertex_ao;
+        diffuse_occlusion *= in.vertex_ao;
+}
+        let static_ao = dot(diffuse_occlusion, vec3<f32>(0.2126, 0.7152, 0.0722));
+        if (static_ao < 0.999) {
+            // Lagarde and Rousiers 2014, "Moving Frostbite to Physically Based Rendering"
+            let roughness = lighting::perceptualRoughnessToRoughness(pbr_input.material.perceptual_roughness);
+            specular_occlusion = saturate(pow(NdotV + static_ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + static_ao);
+        }
 @if(SCREEN_SPACE_AMBIENT_OCCLUSION) {
         let ssao_tex_pos = vec2<i32>(in.position.xy - view.viewport.xy);
         let ssao = textureLoad(screen_space_ambient_occlusion_texture, ssao_tex_pos, 0i).r;
         let ssao_multibounce = ssao_multibounce(ssao, pbr_input.material.base_color.rgb);
         diffuse_occlusion = min(diffuse_occlusion, ssao_multibounce);
-        // Use SSAO to estimate the specular occlusion.
-        // Lagarde and Rousiers 2014, "Moving Frostbite to Physically Based Rendering"
+        // Use SSAO + baked AO to estimate the specular occlusion.
+        let combined_ao = min(static_ao, ssao);
         let roughness = lighting::perceptualRoughnessToRoughness(pbr_input.material.perceptual_roughness);
-        specular_occlusion = saturate(pow(NdotV + ssao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ssao);
+        specular_occlusion = saturate(pow(NdotV + combined_ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + combined_ao);
 }
         pbr_input.diffuse_occlusion = diffuse_occlusion;
         pbr_input.specular_occlusion = specular_occlusion;

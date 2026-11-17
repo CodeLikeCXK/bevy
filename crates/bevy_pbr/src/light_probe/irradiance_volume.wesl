@@ -10,15 +10,20 @@ import package::render::clustered_forward::ClusterableObjectIndexRanges;
 @if(LIGHTMAP) import package::render::mesh_view_types::LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE;
 
 @if(IRRADIANCE_VOLUMES_ARE_USABLE)
+struct IrradianceVolumeSample {
+    irradiance: vec3<f32>,
+    weight: f32,
+    sky_openness: f32,
+    directional_contrast: f32,
+}
 
-/// See:
-/// https://advances.realtimerendering.com/s2006/Mitchell-ShadingInValvesSourceEngine.pdf
-/// Slide 28, "Ambient Cube Basis"
-fn irradiance_volume_light(
+@if(IRRADIANCE_VOLUMES_ARE_USABLE)
+
+fn irradiance_volume_sample(
     world_position: vec3<f32>,
     N: vec3<f32>,
     clusterable_object_index_ranges: ptr<function, ClusterableObjectIndexRanges>,
-) -> vec3<f32> {
+) -> IrradianceVolumeSample {
     // Find all irradiance volumes that contain the fragment. We're going to
     // accumulate all the irradiance from them in a weighted sum.
     var iterator = light_probe_iterator_new(
@@ -27,8 +32,11 @@ fn irradiance_volume_light(
         clusterable_object_index_ranges,
     );
 
+    let luma_weights = vec3<f32>(0.2126f, 0.7152f, 0.0722f);
     var total_weight = 0.0;
     var total_irradiance = vec3(0.0);
+    var total_sky_openness = 0.0;
+    var total_contrast = 0.0;
 
     while (true) {
         var query_result = light_probe_iterator_next(&iterator);
@@ -70,17 +78,83 @@ fn irradiance_volume_light(
         let rgb_y = textureSampleLevel(irradiance_volume_texture, irradiance_volume_sampler, uvw_y, 0.0).rgb;
         let rgb_z = textureSampleLevel(irradiance_volume_texture, irradiance_volume_sampler, uvw_z, 0.0).rgb;
 
+        // Reuse `+Y` when `N.y >= 0.0`; only sample the `+Y` slice explicitly on downward normals.
+        var rgb_up = rgb_y;
+        if (N.y < 0.0f) {
+            rgb_up = textureSampleLevel(
+                irradiance_volume_texture,
+                irradiance_volume_sampler,
+                uvw + vec3(0.0f, 0.0f, 1.0f / 3.0f),
+                0.0,
+            ).rgb;
+        }
+
+        // Intensity-invariant sky openness & directional contrast proxies from the ambient cube.
+        let up_luma = dot(rgb_up, luma_weights);
+        let side_luma = 0.5f * (dot(rgb_x, luma_weights) + dot(rgb_z, luma_weights));
+        let vol_sky_openness = smoothstep(0.30f, 0.68f, up_luma / max(up_luma + side_luma, 1e-5f));
+
+        let axis_luma = vec3<f32>(
+            dot(rgb_x, luma_weights),
+            dot(rgb_y, luma_weights),
+            dot(rgb_z, luma_weights),
+        );
+        let max_axis = max(axis_luma.x, max(axis_luma.y, axis_luma.z));
+        let min_axis = min(axis_luma.x, min(axis_luma.y, axis_luma.z));
+        let vol_contrast = saturate((max_axis - min_axis) / max(max_axis, 1e-5f));
+
         // Use Valve's formula to sample.
         let NN = N * N;
         total_irradiance += (rgb_x * NN.x + rgb_y * NN.y + rgb_z * NN.z) * query_result.intensity *
             query_result.weight;
 
+        total_sky_openness += vol_sky_openness * query_result.weight;
+        total_contrast += vol_contrast * query_result.weight;
         total_weight += query_result.weight;
     }
 
     if (total_weight != 0.0) {
         total_irradiance /= total_weight;
+        total_sky_openness /= total_weight;
+        total_contrast /= total_weight;
     }
 
-    return total_irradiance;
+    return IrradianceVolumeSample(
+        total_irradiance,
+        saturate(total_weight),
+        saturate(total_sky_openness),
+        saturate(total_contrast),
+    );
+}
+
+@if(IRRADIANCE_VOLUMES_ARE_USABLE)
+
+fn irradiance_volume_light_with_weight(
+    world_position: vec3<f32>,
+    N: vec3<f32>,
+    clusterable_object_index_ranges: ptr<function, ClusterableObjectIndexRanges>,
+) -> vec4<f32> {
+    let sample = irradiance_volume_sample(
+        world_position,
+        N,
+        clusterable_object_index_ranges,
+    );
+    return vec4(sample.irradiance, sample.weight);
+}
+
+@if(IRRADIANCE_VOLUMES_ARE_USABLE)
+
+/// See:
+/// https://advances.realtimerendering.com/s2006/Mitchell-ShadingInValvesSourceEngine.pdf
+/// Slide 28, "Ambient Cube Basis"
+fn irradiance_volume_light(
+    world_position: vec3<f32>,
+    N: vec3<f32>,
+    clusterable_object_index_ranges: ptr<function, ClusterableObjectIndexRanges>,
+) -> vec3<f32> {
+    return irradiance_volume_light_with_weight(
+        world_position,
+        N,
+        clusterable_object_index_ranges,
+    ).rgb;
 }

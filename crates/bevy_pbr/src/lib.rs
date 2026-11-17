@@ -107,6 +107,7 @@ use bevy_image::{Image, ImageSampler};
 use bevy_material::AlphaMode;
 use bevy_render::{
     camera::sort_cameras,
+    extract_component::ExtractComponentPlugin,
     extract_resource::ExtractResourcePlugin,
     render_resource::{
         Extent3d, TextureDataOrder, TextureDescriptor, TextureDimension, TextureFormat,
@@ -248,6 +249,7 @@ impl Plugin for PbrPlugin {
                 ScatteringMediumPlugin,
                 AtmospherePlugin,
                 GpuClusteringPlugin,
+                ExtractComponentPlugin::<AoDebugView>::default(),
             ));
 
         #[cfg(feature = "bevy_gltf")]

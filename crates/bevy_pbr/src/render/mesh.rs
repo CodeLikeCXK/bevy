@@ -40,6 +40,9 @@ use bevy_platform::collections::{hash_map::Entry, HashMap};
 use bevy_render::batching::gpu_preprocessing::{
     BufferDataInput, PreviousInstanceInputUniformBuffer,
 };
+use bevy_render::extract_component::ExtractComponent;
+use bevy_render::RenderApp;
+use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::impl_atomic_pod;
 use bevy_render::material_bind_groups::{
     MaterialBindGroupIndex, MaterialBindGroupSlot, MaterialBindingId, RenderMaterialBindings,
@@ -353,6 +356,41 @@ fn mark_all_meshes_for_reextraction(
     }
 }
 
+/// Debug visualization mode for inspecting static vertex AO, diffuse occlusion, and specular occlusion.
+#[derive(Component, ExtractComponent, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+#[reflect(Component, Default, Clone)]
+#[extract_app(RenderApp)]
+pub enum AoDebugView {
+    #[default]
+    Lit,
+    VertexAo,
+    DiffuseOcclusion,
+    SpecularOcclusion,
+    IblSpecularOnly,
+}
+
+impl AoDebugView {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Lit => Self::VertexAo,
+            Self::VertexAo => Self::DiffuseOcclusion,
+            Self::DiffuseOcclusion => Self::SpecularOcclusion,
+            Self::SpecularOcclusion => Self::IblSpecularOnly,
+            Self::IblSpecularOnly => Self::Lit,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lit => "Lit",
+            Self::VertexAo => "Vertex AO",
+            Self::DiffuseOcclusion => "Diffuse Occlusion",
+            Self::SpecularOcclusion => "Specular Occlusion",
+            Self::IblSpecularOnly => "IBL Specular Only",
+        }
+    }
+}
+
 /// This resource caches [`MeshPipelineKey`]s for each view with pre-enabled features needed to properly
 /// setup the [`MeshViewBindGroup`] layout in specialized [`MeshPipeline`]s.
 #[derive(Resource, Deref, DerefMut, Default, Debug, Clone)]
@@ -388,6 +426,7 @@ pub fn check_views_need_specialization(
             Has<ScreenSpaceReflectionsUniform>,
             Has<ContactShadows>,
         ),
+        Option<&AoDebugView>,
     )>,
     mut seen_views: Local<HashSet<RetainedViewEntity>>,
 ) {
@@ -407,6 +446,7 @@ pub fn check_views_need_specialization(
         distance_fog,
         (has_environment_maps, has_irradiance_volumes),
         (has_oit, has_atmosphere, has_ssr, has_contact_shadows),
+        ao_debug_view,
     ) in views.iter_mut()
     {
         seen_views.insert(view.retained_view_entity);
@@ -501,6 +541,9 @@ pub fn check_views_need_specialization(
         if let Some(transmission) = transmission {
             view_key |= MeshPipelineKey::VIEW_TRANSMISSION_TEXTURE;
             view_key |= transmission.quality.pipeline_key();
+        }
+        if let Some(ao_debug) = ao_debug_view {
+            view_key |= MeshPipelineKey::from_ao_debug_view(*ao_debug);
         }
         if !view_key_cache
             .get_mut(&view.retained_view_entity)
@@ -3171,6 +3214,12 @@ bitflags::bitflags! {
         const SCREEN_SPACE_SPECULAR_TRANSMISSION_ULTRA  = 3 << Self::SCREEN_SPACE_SPECULAR_TRANSMISSION_SHIFT_BITS;
         const COLOR_TARGET_FORMAT_RESERVED_BITS = Self::COLOR_TARGET_FORMAT_MASK_BITS
             << Self::COLOR_TARGET_FORMAT_SHIFT_BITS;
+        const AO_DEBUG_RESERVED_BITS = Self::AO_DEBUG_MASK_BITS << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_LIT = 0 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_VERTEX_AO = 1 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_DIFFUSE_OCCLUSION = 2 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_SPECULAR_OCCLUSION = 3 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_IBL_SPECULAR_ONLY = 4 << Self::AO_DEBUG_SHIFT_BITS;
         const ALL_RESERVED_BITS =
             Self::BLEND_RESERVED_BITS.bits() |
             Self::MSAA_RESERVED_BITS.bits() |
@@ -3178,7 +3227,8 @@ bitflags::bitflags! {
             Self::SHADOW_FILTER_METHOD_RESERVED_BITS.bits() |
             Self::VIEW_PROJECTION_RESERVED_BITS.bits() |
             Self::SCREEN_SPACE_SPECULAR_TRANSMISSION_RESERVED_BITS.bits() |
-            Self::COLOR_TARGET_FORMAT_RESERVED_BITS.bits();
+            Self::COLOR_TARGET_FORMAT_RESERVED_BITS.bits() |
+            Self::AO_DEBUG_RESERVED_BITS.bits();
     }
 }
 
@@ -3210,6 +3260,35 @@ impl MeshPipelineKey {
     const COLOR_TARGET_FORMAT_SHIFT_BITS: u64 = Self::SCREEN_SPACE_SPECULAR_TRANSMISSION_MASK_BITS
         .count_ones() as u64
         + Self::SCREEN_SPACE_SPECULAR_TRANSMISSION_SHIFT_BITS;
+
+    const AO_DEBUG_MASK_BITS: u64 = 0b111;
+    const AO_DEBUG_SHIFT_BITS: u64 =
+        Self::COLOR_TARGET_FORMAT_MASK_BITS.count_ones() as u64 + Self::COLOR_TARGET_FORMAT_SHIFT_BITS;
+
+    pub fn from_ao_debug_view(mode: AoDebugView) -> Self {
+        match mode {
+            AoDebugView::Lit => Self::AO_DEBUG_LIT,
+            AoDebugView::VertexAo => Self::AO_DEBUG_VERTEX_AO,
+            AoDebugView::DiffuseOcclusion => Self::AO_DEBUG_DIFFUSE_OCCLUSION,
+            AoDebugView::SpecularOcclusion => Self::AO_DEBUG_SPECULAR_OCCLUSION,
+            AoDebugView::IblSpecularOnly => Self::AO_DEBUG_IBL_SPECULAR_ONLY,
+        }
+    }
+
+    pub fn ao_debug_shader_def(self) -> Option<&'static str> {
+        let mode = self.intersection(Self::AO_DEBUG_RESERVED_BITS);
+        if mode == Self::AO_DEBUG_VERTEX_AO {
+            Some("AO_DEBUG_VERTEX_AO")
+        } else if mode == Self::AO_DEBUG_DIFFUSE_OCCLUSION {
+            Some("AO_DEBUG_DIFFUSE_OCCLUSION")
+        } else if mode == Self::AO_DEBUG_SPECULAR_OCCLUSION {
+            Some("AO_DEBUG_SPECULAR_OCCLUSION")
+        } else if mode == Self::AO_DEBUG_IBL_SPECULAR_ONLY {
+            Some("AO_DEBUG_IBL_SPECULAR_ONLY")
+        } else {
+            None
+        }
+    }
 
     pub fn from_msaa_samples(msaa_samples: u32) -> Self {
         let msaa_bits =
@@ -3615,6 +3694,10 @@ impl SpecializedMeshPipeline for MeshPipeline {
             shader_defs.push("VIEW_PROJECTION_PERSPECTIVE".into());
         } else if view_projection == MeshPipelineKey::VIEW_PROJECTION_ORTHOGRAPHIC {
             shader_defs.push("VIEW_PROJECTION_ORTHOGRAPHIC".into());
+        }
+
+        if let Some(def) = key.ao_debug_shader_def() {
+            shader_defs.push(def.into());
         }
 
         #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]

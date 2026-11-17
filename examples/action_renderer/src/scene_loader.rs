@@ -38,6 +38,23 @@ pub struct MeshletSceneManifest {
     pub gameplay_markers: Vec<SceneGameplayMarker>,
     #[serde(default)]
     pub skipped_non_opaque: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub world_hdri: Option<SceneWorldHdri>,
+}
+
+fn default_hdri_strength() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SceneWorldHdri {
+    pub image: String,
+    #[serde(default = "default_hdri_strength")]
+    pub strength: f32,
+    #[serde(default)]
+    pub yaw_degrees: f32,
+    #[serde(default)]
+    pub projection: String,
 }
 
 fn default_alpha_mode() -> String {
@@ -197,7 +214,7 @@ impl Plugin for MeshletScenePlugin {
     }
 }
 
-fn find_manifest_path(scene_dir: &Path, manifest_file: Option<&str>) -> Option<PathBuf> {
+pub fn find_manifest_path(scene_dir: &Path, manifest_file: Option<&str>) -> Option<PathBuf> {
     if let Some(name) = manifest_file {
         let p = scene_dir.join(name);
         if p.exists() {

@@ -1,8 +1,11 @@
+mod ao_baker;
 mod lod_mesh;
 mod scene;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use ao_baker::{bake_vertex_ao, AoBakeConfig, AoBvh};
 
 use bevy_asset::saver::{AssetSaver, SavedAsset};
 use bevy_asset::{AssetPath, RenderAssetUsages};
@@ -67,6 +70,26 @@ struct Args {
     /// 场景模式下同一图元出现 >= N 次时自动走局部实例化复用（不并入静态大网格）；0 表示禁用自动实例化
     #[arg(long, default_value_t = 3)]
     auto_instance_min: usize,
+
+    /// 禁用离线静态逐顶点 AO 烘焙（默认开启；禁用后所有顶点 AO 为 1.0）
+    #[arg(long, default_value_t = false)]
+    no_ao: bool,
+
+    /// 静态逐顶点 AO 每个顶点的余弦加权半球射线采样数（默认 32）
+    #[arg(long, default_value_t = 32)]
+    ao_samples: u32,
+
+    /// 静态逐顶点 AO 最大遮蔽检测半径（米，默认 1.5；建议控制为接触遮蔽尺度，避免与 IrradianceVolume 重复压暗室内）
+    #[arg(long, default_value_t = 1.5)]
+    ao_radius: f32,
+
+    /// 静态逐顶点 AO 对比度幂指数（默认 1.0，>1.0 会加深缝隙对比度）
+    #[arg(long, default_value_t = 1.0)]
+    ao_power: f32,
+
+    /// 静态逐顶点 AO 射线法线偏移量（米）；未指定时自动取 clamp(ao_radius * 0.0025, 0.0005, 0.01)
+    #[arg(long)]
+    ao_bias: Option<f32>,
 }
 
 use bevy_tasks::{AsyncComputeTaskPool, TaskPool};
@@ -77,11 +100,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化多线程任务池（供 METIS 与 Meshlet 简化算法并行加速）
     AsyncComputeTaskPool::get_or_init(TaskPool::default);
 
+    let ao_config = AoBakeConfig {
+        enabled: !args.no_ao,
+        samples: args.ao_samples,
+        radius: args.ao_radius,
+        power: args.ao_power,
+        bias: args.ao_bias,
+    };
+
     println!("=======================================================");
     println!("           Bevy Meshlet 离线预处理工具: makemeshlet     ");
     println!("=======================================================");
     println!("输入文件: {}", args.input.display());
     println!("量化因子: {} (精度: 1/2^{} cm)", args.quantization, args.quantization);
+    if ao_config.is_active() {
+        println!(
+            "静态顶点 AO: ON (samples={}, radius={:.2}m, power={:.2}, bias={:.4}m)",
+            ao_config.samples,
+            ao_config.radius,
+            ao_config.power,
+            ao_config.effective_bias()
+        );
+    } else {
+        println!("静态顶点 AO: OFF");
+    }
 
     if !args.input.exists() {
         return Err(format!("输入文件不存在: {}", args.input.display()).into());
@@ -114,6 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             grid_size: args.grid_size,
             max_batch_tris: args.max_batch_tris,
             auto_instance_min: args.auto_instance_min,
+            ao: ao_config,
         };
         return scene::run_scene_export(&document, &buffers, &images, &options);
     }
@@ -218,11 +261,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
             bevy_mesh.insert_indices(Indices::U32(indices));
 
+            let vertex_ao = if ao_config.is_active() {
+                let t_ao = Instant::now();
+                let pos_slice = bevy_mesh
+                    .attribute(Mesh::ATTRIBUTE_POSITION)
+                    .and_then(|a| a.as_float3())
+                    .unwrap_or(&[]);
+                let norm_slice = bevy_mesh
+                    .attribute(Mesh::ATTRIBUTE_NORMAL)
+                    .and_then(|a| a.as_float3())
+                    .unwrap_or(&[]);
+                let idx_slice: &[u32] = match bevy_mesh.indices() {
+                    Some(Indices::U32(v)) => v.as_slice(),
+                    _ => &[],
+                };
+                let bvh = AoBvh::from_indexed_mesh(pos_slice, idx_slice);
+                let ao = bake_vertex_ao(&bvh, pos_slice, norm_slice, ao_config);
+                println!(
+                    "  [AO] 静态顶点 AO 烘焙完成 ({} 顶点, {:.2}s)",
+                    ao.len(),
+                    t_ao.elapsed().as_secs_f64()
+                );
+                Some(ao)
+            } else {
+                None
+            };
+
             // 3. 执行核心 Meshlet 预处理算法
             println!("\n[2/4] 正在执行 Meshlet 簇划分与分层 LOD 构建...");
             println!("      (METIS 图分割 + 边界锁定边折叠简化 + BVH8 树构建)");
             let start_meshlet = Instant::now();
-            let meshlet_mesh = match MeshletMesh::from_mesh(&bevy_mesh, args.quantization) {
+            let meshlet_mesh = match MeshletMesh::from_mesh_with_ao(
+                &bevy_mesh,
+                args.quantization,
+                vertex_ao.as_deref(),
+            ) {
                 Ok(meshlet) => meshlet,
                 Err(err) => {
                     eprintln!("  [错误] 预处理失败: {:?}", err);

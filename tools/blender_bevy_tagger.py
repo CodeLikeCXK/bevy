@@ -23,6 +23,8 @@ bl_info = {
 }
 
 import array
+import json
+import math
 import os
 import random
 from collections import defaultdict, deque
@@ -1059,6 +1061,130 @@ class BEVY_OT_fix_zero_lights(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _find_world_env_texture_and_mapping(start_node):
+    """沿着 World 节点树上游追踪，定位环境纹理节点 (ShaderNodeTexEnvironment) 与其 Mapping 旋转。"""
+    visited = set()
+    queue = deque([start_node])
+    env_node = None
+    while queue:
+        node = queue.popleft()
+        if node is None or node in visited:
+            continue
+        visited.add(node)
+        if node.type == "TEX_ENVIRONMENT" and getattr(node, "image", None) is not None:
+            env_node = node
+            break
+        for sock in node.inputs:
+            if sock.is_linked:
+                for link in sock.links:
+                    queue.append(link.from_node)
+
+    if env_node is None:
+        return None, 0.0
+
+    # 追踪 Vector 输入上的 Mapping / VectorRotate Z 轴旋转
+    yaw_rad = 0.0
+    vec_sock = env_node.inputs.get("Vector")
+    if vec_sock and vec_sock.is_linked:
+        vec_visited = set()
+        vec_queue = deque([link.from_node for link in vec_sock.links])
+        while vec_queue:
+            vnode = vec_queue.popleft()
+            if vnode is None or vnode in vec_visited:
+                continue
+            vec_visited.add(vnode)
+            if vnode.type == "MAPPING":
+                rot_sock = vnode.inputs.get("Rotation")
+                if rot_sock and hasattr(rot_sock, "default_value"):
+                    yaw_rad += -float(rot_sock.default_value[2])
+            elif vnode.type == "VECTOR_ROTATE":
+                angle_sock = vnode.inputs.get("Angle")
+                if angle_sock and hasattr(angle_sock, "default_value"):
+                    yaw_rad += -float(angle_sock.default_value)
+            for sock in vnode.inputs:
+                if sock.is_linked:
+                    for link in sock.links:
+                        vec_queue.append(link.from_node)
+
+    return env_node, math.degrees(yaw_rad)
+
+
+def _extract_world_hdri_config(scene, glb_filepath):
+    """若场景 World 使用了 HDRI 环境贴图，则提取贴图路径、强度与旋转配置；否则返回 None。"""
+    world = getattr(scene, "world", None)
+    if world is None or not getattr(world, "use_nodes", False) or world.node_tree is None:
+        return None
+
+    nodes = world.node_tree.nodes
+    out_node = next(
+        (n for n in nodes if n.type == "OUTPUT_WORLD" and getattr(n, "is_active_output", False)),
+        None,
+    ) or next((n for n in nodes if n.type == "OUTPUT_WORLD"), None)
+    if out_node is None:
+        return None
+
+    surf_sock = out_node.inputs.get("Surface")
+    if surf_sock is None or not surf_sock.is_linked:
+        return None
+
+    bg_node = surf_sock.links[0].from_node
+    if bg_node is None:
+        return None
+
+    # 兼容直接连接 Background 或经由 Mix Shader 连接到 World Output
+    strength = 1.0
+    bg_queue = deque([bg_node])
+    bg_visited = set()
+    chosen_bg = None
+    while bg_queue:
+        n = bg_queue.popleft()
+        if n is None or n in bg_visited:
+            continue
+        bg_visited.add(n)
+        if n.type in {"BACKGROUND", "EMISSION"}:
+            chosen_bg = n
+            break
+        for sock in n.inputs:
+            if sock.is_linked:
+                for link in sock.links:
+                    bg_queue.append(link.from_node)
+
+    search_root = chosen_bg if chosen_bg is not None else bg_node
+    if chosen_bg is not None:
+        str_sock = chosen_bg.inputs.get("Strength")
+        if str_sock is not None and hasattr(str_sock, "default_value"):
+            strength = float(str_sock.default_value)
+
+    env_node, yaw_degrees = _find_world_env_texture_and_mapping(search_root)
+    if env_node is None or env_node.image is None:
+        return None
+
+    img = env_node.image
+    abs_path = ""
+    if getattr(img, "filepath", ""):
+        abs_path = os.path.normpath(bpy.path.abspath(img.filepath, library=img.library))
+
+    resolved_path = abs_path if abs_path and os.path.isfile(abs_path) else ""
+    if not resolved_path and getattr(img, "packed_file", None) is not None:
+        stem = os.path.splitext(os.path.basename(glb_filepath))[0]
+        ext = os.path.splitext(abs_path or img.name)[1] or ".hdr"
+        unpacked_path = os.path.join(os.path.dirname(glb_filepath), f"{stem}_world_hdri{ext}")
+        with open(unpacked_path, "wb") as f:
+            f.write(img.packed_file.data)
+        resolved_path = os.path.normpath(unpacked_path)
+
+    if not resolved_path:
+        return None
+
+    projection = "equirectangular" if getattr(env_node, "projection", "EQUIRECTANGULAR") == "EQUIRECTANGULAR" else "mirror_ball"
+    return {
+        "image": resolved_path,
+        "strength": max(0.0, strength),
+        "yaw_degrees": yaw_degrees,
+        "projection": projection,
+    }
+
+
 class BEVY_OT_export_glb(bpy.types.Operator):
     """一键导出含 Custom Properties (extras) 和灯光的 GLB 文件"""
     bl_idname = "bevy.export_glb"
@@ -1086,6 +1212,14 @@ class BEVY_OT_export_glb(bpy.types.Operator):
             and "hdri_sky" not in obj.name.lower()
         )
 
+        hdri_cfg = _extract_world_hdri_config(context.scene, filepath)
+        had_prev_prop = "bevy_world_hdri" in context.scene
+        prev_prop_val = context.scene.get("bevy_world_hdri")
+        if hdri_cfg is not None:
+            context.scene["bevy_world_hdri"] = json.dumps(hdri_cfg, ensure_ascii=False)
+        elif had_prev_prop:
+            del context.scene["bevy_world_hdri"]
+
         export_kwargs = {
             "filepath": filepath,
             "export_format": "GLB",
@@ -1104,14 +1238,32 @@ class BEVY_OT_export_glb(bpy.types.Operator):
         except Exception:
             pass
 
-        bpy.ops.export_scene.gltf(**export_kwargs)
+        try:
+            bpy.ops.export_scene.gltf(**export_kwargs)
+        finally:
+            if had_prev_prop:
+                context.scene["bevy_world_hdri"] = prev_prop_val
+            elif "bevy_world_hdri" in context.scene:
+                del context.scene["bevy_world_hdri"]
+
+        sidecar_path = os.path.splitext(filepath)[0] + ".bevy_hdri.json"
+        if hdri_cfg is not None:
+            with open(sidecar_path, "w", encoding="utf-8") as f:
+                json.dump(hdri_cfg, f, indent=2, ensure_ascii=False)
+        elif os.path.isfile(sidecar_path):
+            try:
+                os.remove(sidecar_path)
+            except OSError:
+                pass
+
+        hdri_note = f"（含 World HDRI: {os.path.basename(hdri_cfg['image'])}）" if hdri_cfg else ""
         if zero_lights > 0:
             self.report(
                 {"WARNING"},
-                f"GLB 已导出: {filepath}（提示：仍有 {zero_lights} 盏灯强度为 0，建议先点“修复零强度灯光”）",
+                f"GLB 已导出: {filepath}{hdri_note}（提示：仍有 {zero_lights} 盏灯强度为 0，建议先点“修复零强度灯光”）",
             )
         else:
-            self.report({"INFO"}, f"GLB 导出成功: {filepath}")
+            self.report({"INFO"}, f"GLB 导出成功: {filepath}{hdri_note}")
         return {"FINISHED"}
 
 

@@ -305,9 +305,17 @@ fn get_meshlet_vertex_position(meshlet: ptr<function, Meshlet>, vertex_id: u32) 
 }
 
 @if(MESHLET_MESH_MATERIAL_PASS)
+fn get_meshlet_vertex_normal_and_ao(meshlet: ptr<function, Meshlet>, vertex_id: u32) -> vec4<f32> {
+    let packed = meshlet_vertex_normals[(*meshlet).start_vertex_attribute_id + vertex_id];
+    let oct_u = vec2<u32>(extractBits(packed, 0u, 12u), extractBits(packed, 12u, 12u));
+    let oct = (vec2<f32>(oct_u) - vec2<f32>(2047.0)) / 2047.0;
+    let ao = f32(extractBits(packed, 24u, 8u)) / 255.0;
+    return vec4<f32>(octahedral_decode_signed(oct), ao);
+}
+
+@if(MESHLET_MESH_MATERIAL_PASS)
 fn get_meshlet_vertex_normal(meshlet: ptr<function, Meshlet>, vertex_id: u32) -> vec3<f32> {
-    let packed_normal = meshlet_vertex_normals[(*meshlet).start_vertex_attribute_id + vertex_id];
-    return octahedral_decode_signed(unpack2x16snorm(packed_normal));
+    return get_meshlet_vertex_normal_and_ao(meshlet, vertex_id).xyz;
 }
 
 @if(MESHLET_MESH_MATERIAL_PASS)

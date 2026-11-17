@@ -17,7 +17,7 @@ use thiserror::Error;
 const MESHLET_MESH_ASSET_MAGIC: u64 = 1717551717668;
 
 /// The current version of the [`MeshletMesh`] asset format.
-pub const MESHLET_MESH_ASSET_VERSION: u64 = 3;
+pub const MESHLET_MESH_ASSET_VERSION: u64 = 4;
 
 /// A mesh that has been pre-processed into multiple small clusters of triangles called meshlets.
 ///
@@ -41,7 +41,7 @@ pub const MESHLET_MESH_ASSET_VERSION: u64 = 3;
 pub struct MeshletMesh {
     /// Quantized and bitstream-packed vertex positions for meshlet vertices.
     pub(crate) vertex_positions: Arc<[u32]>,
-    /// Octahedral-encoded and 2x16snorm packed normals for meshlet vertices.
+    /// Octahedral-encoded 2x12-bit normals + 8-bit static vertex AO packed into `u32` for meshlet vertices.
     pub(crate) vertex_normals: Arc<[u32]>,
     /// Uncompressed vertex texture coordinates for meshlet vertices.
     pub(crate) vertex_uvs: Arc<[Vec2]>,
@@ -224,9 +224,9 @@ impl AssetLoader for MeshletMeshLoader {
             return Err(MeshletMeshSaveOrLoadError::WrongFileType);
         }
 
-        // Load and check asset version
+        // Load and check asset version (accept v3 legacy 2x16snorm normals and v4 2x12+8bit AO)
         let version = async_read_u64(reader).await?;
-        if version != MESHLET_MESH_ASSET_VERSION {
+        if version != 3 && version != MESHLET_MESH_ASSET_VERSION {
             return Err(MeshletMeshSaveOrLoadError::WrongVersion { found: version });
         }
 
@@ -240,7 +240,14 @@ impl AssetLoader for MeshletMeshLoader {
         // Load and decompress asset data
         let reader = &mut FrameDecoder::new(AsyncReadSyncAdapter(reader));
         let vertex_positions = read_slice(reader)?;
-        let vertex_normals = read_slice(reader)?;
+        let mut vertex_normals: Arc<[u32]> = read_slice(reader)?;
+        if version == 3 {
+            let upgraded: Vec<u32> = vertex_normals
+                .iter()
+                .map(|&packed| unpack_v3_normal_to_v4(packed))
+                .collect();
+            vertex_normals = upgraded.into();
+        }
         let vertex_uvs = read_slice(reader)?;
         let indices = read_slice(reader)?;
         let bvh = read_slice(reader)?;
@@ -306,6 +313,17 @@ fn read_slice<T: Pod>(reader: &mut dyn Read) -> Result<Arc<[T]>, std::io::Error>
     reader.read_exact(bytemuck::cast_slice_mut(slice))?;
 
     Ok(data)
+}
+
+/// Converts legacy v3 `2x16snorm` octahedral normal into v4 `2x12 + 8-bit AO (1.0)` layout.
+fn unpack_v3_normal_to_v4(packed: u32) -> u32 {
+    let ix = (packed & 0xFFFF) as i16;
+    let iy = ((packed >> 16) & 0xFFFF) as i16;
+    let fx = (ix as f32 / 32767.0).clamp(-1.0, 1.0);
+    let fy = (iy as f32 / 32767.0).clamp(-1.0, 1.0);
+    let qx = ((fx * 2047.0).round() as i32 + 2047).clamp(0, 4094) as u32;
+    let qy = ((fy * 2047.0).round() as i32 + 2047).clamp(0, 4094) as u32;
+    qx | (qy << 12) | (255u32 << 24)
 }
 
 // TODO: Use async for everything and get rid of this adapter

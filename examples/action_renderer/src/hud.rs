@@ -15,12 +15,17 @@ use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     ecs::system::SystemParam,
     light::{DirectionalLightShadowMap, IrradianceVolume},
-    pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d},
+    pbr::{
+        experimental::meshlet::{MeshletMesh, MeshletMesh3d},
+        AoDebugView,
+    },
     prelude::*,
 };
 
 use crate::{
+    irradiance::IrradianceConfig,
     scene_loader::MeshletSceneConfig,
+    skybox::{SkyboxConfig, SkyboxStatus},
     streaming::{Mesh3dLodTris, SceneChunk},
 };
 
@@ -53,6 +58,7 @@ impl Plugin for HudPlugin {
                 (
                     cache_meshlet_asset_stats,
                     toggle_hud_visibility,
+                    cycle_ao_debug_view,
                     update_hud_text,
                 )
                     .chain(),
@@ -137,6 +143,19 @@ fn toggle_hud_visibility(
     }
 }
 
+fn cycle_ao_debug_view(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cameras: Query<&mut AoDebugView, With<Camera3d>>,
+) {
+    if !keys.just_pressed(KeyCode::F4) {
+        return;
+    }
+    for mut mode in &mut cameras {
+        *mode = mode.next();
+        info!("调试视图切换为: {}", mode.label());
+    }
+}
+
 fn format_compact_count(count: usize) -> String {
     if count >= 1_000_000 {
         format!("{:.2}M", count as f64 / 1_000_000.0)
@@ -157,7 +176,7 @@ struct HudLightQueries<'w, 's> {
 
 #[derive(SystemParam)]
 struct HudGeometryQueries<'w, 's> {
-    camera_query: Query<'w, 's, &'static GlobalTransform, With<Camera3d>>,
+    camera_query: Query<'w, 's, (&'static GlobalTransform, Option<&'static AoDebugView>), With<Camera3d>>,
     chunks: Query<'w, 's, &'static SceneChunk>,
     meshlet_entities: Query<'w, 's, &'static MeshletMesh3d>,
     mesh3d_entities: Query<
@@ -179,6 +198,9 @@ fn update_hud_text(
     diagnostics: Res<DiagnosticsStore>,
     scene_config: Res<MeshletSceneConfig>,
     shadow_map: Res<DirectionalLightShadowMap>,
+    irradiance_config: Res<IrradianceConfig>,
+    skybox_config: Res<SkyboxConfig>,
+    skybox_status: Res<SkyboxStatus>,
     stats_cache: Res<MeshletAssetStatsCache>,
     lights: HudLightQueries,
     geom: HudGeometryQueries,
@@ -250,9 +272,9 @@ fn update_hud_text(
         }
     }
     let gi_state = if lights.gi_volumes.is_empty() {
-        "OFF"
+        format!("OFF ({:.0})", irradiance_config.intensity)
     } else {
-        "ON"
+        format!("ON ({:.0})", irradiance_config.intensity)
     };
 
     // 4. Chunk 流送与 Meshlet 统计
@@ -277,7 +299,14 @@ fn update_hud_text(
     }
 
     // 5. Mesh3d LOD 可见多边形统计（结合相机与 VisibilityRange 估算当前激活 LOD 面数）
-    let cam_pos = geom.camera_query.iter().next().map(|t| t.translation());
+    let mut cam_pos = None;
+    let mut debug_view_label = AoDebugView::Lit.label();
+    if let Some((tf, dbg_opt)) = geom.camera_query.iter().next() {
+        cam_pos = Some(tf.translation());
+        if let Some(dbg) = dbg_opt {
+            debug_view_label = dbg.label();
+        }
+    }
     let mut mesh3d_total_entities = 0usize;
     let mut mesh3d_visible_entities = 0usize;
     let mut mesh3d_visible_tris = 0usize;
@@ -304,22 +333,36 @@ fn update_hud_text(
 
     let total_poly_estimate = total_meshlet_pool_tris + mesh3d_visible_tris;
 
+    let sky_state = if skybox_status.visible {
+        format!(
+            "ON (env {:.0} | {})",
+            skybox_config.env_intensity, skybox_status.mode_label
+        )
+    } else {
+        format!(
+            "OFF (env {:.0} | {})",
+            skybox_config.env_intensity, skybox_status.mode_label
+        )
+    };
+
     text.0 = format!(
-        "FPS: {:.1} (avg {:.1}) | Frame: {:.1} ms\n\
+        "FPS: {:.1} (avg {:.1}) | Frame: {:.1} ms | View: {}\n\
          {}\n\
-         Lights: Dir {} (Shadow {}) | Local {}/{} | GI: {}\n\
+         Lights: Dir {} (Shadow {}) | Local {}/{} | GI: {} | Sky: {}\n\
          Chunks: {}/{} | Meshlet: {} inst, {} clusters ({} pool tris)\n\
          Mesh3d LOD: {}/{} visible ({} tris) | Total Pool Tris: {}\n\
-         [F3] Toggle HUD   [Space] Toggle GI",
+         [F3] HUD  [F4] View  [Space] GI  [[ / ]] GI±  [B] Sky  [- / =] Env±",
         fps_cur,
         fps_avg,
         frame_ms,
+        debug_view_label,
         shadow_line,
         dir_total,
         dir_shadow_count,
         local_active,
         local_total,
         gi_state,
+        sky_state,
         chunk_loaded,
         chunk_total,
         meshlet_inst_count,
