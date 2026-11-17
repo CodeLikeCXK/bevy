@@ -11,19 +11,21 @@ use std::path::{Path, PathBuf};
 use bevy::{
     anti_alias::fxaa::Fxaa,
     asset::io::AssetSourceBuilder,
+    camera::RenderTarget,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
-    image::{ImageAddressMode, ImagePlugin, ImageSamplerDescriptor},
+    image::{ImageAddressMode, ImagePlugin, ImageSampler, ImageSamplerDescriptor},
     light::DirectionalLightShadowMap,
     pbr::{experimental::meshlet::MeshletPlugin, AoDebugView},
     post_process::bloom::Bloom,
     prelude::*,
     render::{
         diagnostic::RenderDiagnosticsPlugin,
+        render_resource::{Extent3d, TextureFormat},
         settings::{Backends, Dx12Compiler, WgpuSettings},
         RenderPlugin,
     },
-    window::{PresentMode, WindowResolution},
+    window::{PresentMode, PrimaryWindow, WindowResized, WindowResolution},
 };
 use clap::Parser;
 
@@ -185,11 +187,27 @@ struct Cli {
     /// 禁用天空盒显示与场景清单自动加载 HDRI（仅保留默认占位环境光）
     #[arg(long, default_value_t = false)]
     no_skybox: bool,
+
+    /// 3D 场景内部分辨率缩放比例 (0.25..=1.0)，低于 1.0 时先渲染到缩放 RT 再全屏双线性放大（HUD 保持原生清晰度）
+    #[arg(long, default_value_t = 1.0)]
+    render_scale: f32,
 }
 
 #[derive(Resource, Clone)]
 struct RenderOptions {
     enable_bloom: bool,
+}
+
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct RenderResolutionConfig {
+    pub scale: f32,
+    pub internal_size: UVec2,
+    pub output_size: UVec2,
+}
+
+#[derive(Resource)]
+struct ScaledRenderTarget {
+    image: Handle<Image>,
 }
 
 fn resolve_bevy_assets_dir() -> String {
@@ -328,6 +346,13 @@ fn main() {
     default_sampler.set_address_mode(ImageAddressMode::Repeat);
     default_sampler.anisotropy_clamp = 4;
 
+    let render_scale = cli.render_scale.clamp(0.25, 1.0);
+    let initial_output_size = UVec2::new(
+        ((cli.width as f32) * cli.scale_factor).round().max(1.0) as u32,
+        ((cli.height as f32) * cli.scale_factor).round().max(1.0) as u32,
+    );
+    let initial_internal_size = compute_scaled_size(initial_output_size, render_scale);
+
     app.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: 0.02,
@@ -338,6 +363,11 @@ fn main() {
     })
     .insert_resource(RenderOptions {
         enable_bloom: cli.bloom,
+    })
+    .insert_resource(RenderResolutionConfig {
+        scale: render_scale,
+        internal_size: initial_internal_size,
+        output_size: initial_output_size,
     })
     .insert_resource(MeshletSceneConfig {
         scene_dir: cli.scene_dir,
@@ -421,15 +451,38 @@ fn main() {
         app.add_plugins(RenderDiagnosticsPlugin);
     }
 
-    app.add_systems(Startup, setup_camera).run();
+    app.add_systems(Startup, setup_camera)
+        .add_systems(Update, sync_scaled_render_target_on_resize)
+        .run();
+}
+
+fn compute_scaled_size(output_size: UVec2, scale: f32) -> UVec2 {
+    let clamped_out = output_size.max(UVec2::ONE);
+    if scale >= 0.999 {
+        return clamped_out;
+    }
+    let w = ((clamped_out.x as f32) * scale).round().max(64.0) as u32;
+    let h = ((clamped_out.y as f32) * scale).round().max(64.0) as u32;
+    UVec2::new(w.min(clamped_out.x.max(64)), h.min(clamped_out.y.max(64)))
 }
 
 fn setup_camera(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     render_opts: Res<RenderOptions>,
+    mut resolution_cfg: ResMut<RenderResolutionConfig>,
     skybox_config: Res<SkyboxConfig>,
+    mut images: ResMut<Assets<Image>>,
+    primary_window: Option<Single<&Window, With<PrimaryWindow>>>,
 ) {
+    if let Some(window) = primary_window {
+        let phys = UVec2::new(window.physical_width(), window.physical_height());
+        if phys.x > 0 && phys.y > 0 {
+            resolution_cfg.output_size = phys;
+            resolution_cfg.internal_size = compute_scaled_size(phys, resolution_cfg.scale);
+        }
+    }
+
     let mut cam = commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(4.5, 2.2, 5.5).looking_at(Vec3::new(0.0, 0.6, 0.8), Vec3::Y),
@@ -447,5 +500,103 @@ fn setup_camera(
     ));
     if render_opts.enable_bloom {
         cam.insert(Bloom::NATURAL);
+    }
+
+    if resolution_cfg.scale < 0.999 {
+        let internal = resolution_cfg.internal_size;
+        let mut target_image = Image::new_target_texture(
+            internal.x,
+            internal.y,
+            TextureFormat::Rgba8Unorm,
+            Some(TextureFormat::Rgba8UnormSrgb),
+        );
+        // 显式使用 ClampToEdge + 双线性过滤，避免全局默认 Repeat 寻址在全屏放大边缘采到对面像素
+        target_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::linear());
+        let target_handle = images.add(target_image);
+
+        cam.insert((
+            Camera {
+                order: -1,
+                ..default()
+            },
+            RenderTarget::Image(target_handle.clone().into()),
+        ));
+
+        commands.insert_resource(ScaledRenderTarget {
+            image: target_handle.clone(),
+        });
+
+        // 原生分辨率 UI 合成相机：先画全屏缩放后的 3D 画面，再由上层 HudRoot (GlobalZIndex 0) 渲染原生清晰度文字
+        commands.spawn((
+            Camera2d,
+            Camera {
+                order: 1,
+                clear_color: ClearColorConfig::Custom(Color::BLACK),
+                ..default()
+            },
+            Msaa::Off,
+            IsDefaultUiCamera,
+        ));
+
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..default()
+            },
+            ImageNode::new(target_handle),
+            GlobalZIndex(-100),
+        ));
+
+        info!(
+            "启用 3D 内部分辨率缩放: scale={:.2}x, internal={}x{}, output={}x{}",
+            resolution_cfg.scale,
+            resolution_cfg.internal_size.x,
+            resolution_cfg.internal_size.y,
+            resolution_cfg.output_size.x,
+            resolution_cfg.output_size.y,
+        );
+    }
+}
+
+fn sync_scaled_render_target_on_resize(
+    mut resize_events: MessageReader<WindowResized>,
+    primary_window: Option<Single<&Window, With<PrimaryWindow>>>,
+    mut resolution_cfg: ResMut<RenderResolutionConfig>,
+    scaled_target: Option<Res<ScaledRenderTarget>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let Some(window) = primary_window else {
+        resize_events.clear();
+        return;
+    };
+    let mut has_primary_resize = false;
+    for _ev in resize_events.read() {
+        has_primary_resize = true;
+    }
+    if !has_primary_resize {
+        return;
+    }
+
+    let phys = UVec2::new(window.physical_width(), window.physical_height());
+    if phys.x == 0 || phys.y == 0 || phys == resolution_cfg.output_size {
+        return;
+    }
+
+    let new_internal = compute_scaled_size(phys, resolution_cfg.scale);
+    resolution_cfg.output_size = phys;
+    resolution_cfg.internal_size = new_internal;
+
+    if let Some(target) = scaled_target
+        && let Some(mut image) = images.get_mut(&target.image)
+    {
+        image.resize(Extent3d {
+            width: new_internal.x,
+            height: new_internal.y,
+            depth_or_array_layers: 1,
+        });
     }
 }

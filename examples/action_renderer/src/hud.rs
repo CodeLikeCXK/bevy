@@ -27,6 +27,7 @@ use crate::{
     scene_loader::MeshletSceneConfig,
     skybox::{SkyboxConfig, SkyboxStatus},
     streaming::{Mesh3dLodTris, SceneChunk},
+    RenderResolutionConfig,
 };
 
 #[derive(Component)]
@@ -199,6 +200,7 @@ fn update_hud_text(
     time: Res<Time>,
     mut timer: ResMut<HudRefreshTimer>,
     diagnostics: Res<DiagnosticsStore>,
+    resolution_cfg: Res<RenderResolutionConfig>,
     scene_config: Res<MeshletSceneConfig>,
     shadow_map: Res<DirectionalLightShadowMap>,
     irradiance_config: Res<IrradianceConfig>,
@@ -359,8 +361,24 @@ fn update_hud_text(
         _ => "",
     };
 
+    let res_label = if resolution_cfg.scale < 0.999 {
+        format!(
+            "{}x{} -> {}x{} ({:.2}x)",
+            resolution_cfg.internal_size.x,
+            resolution_cfg.internal_size.y,
+            resolution_cfg.output_size.x,
+            resolution_cfg.output_size.y,
+            resolution_cfg.scale
+        )
+    } else {
+        format!(
+            "{}x{} (1.00x)",
+            resolution_cfg.output_size.x, resolution_cfg.output_size.y
+        )
+    };
+
     text.0 = format!(
-        "FPS: {:.1} (avg {:.1}) | Frame: {:.1} ms | View: {}\n\
+        "FPS: {:.1} (avg {:.1}) | Frame: {:.1} ms | Res: {} | View: {}\n\
          {}\n\
          Lights: Dir {} (Shadow {}) | Local {}/{} | GI: {} | Sky: {}\n\
          Chunks: {}/{} | Meshlet: {} inst, {} clusters ({} pool tris)\n\
@@ -369,6 +387,7 @@ fn update_hud_text(
         fps_cur,
         fps_avg,
         frame_ms,
+        res_label,
         debug_view_label,
         shadow_line,
         dir_total,
