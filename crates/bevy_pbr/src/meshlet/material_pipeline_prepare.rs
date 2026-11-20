@@ -46,6 +46,7 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
     render_material_instances: Res<RenderMaterialInstances>,
     material_bind_group_allocators: Res<MaterialBindGroupAllocators>,
     mut mesh_vertex_buffer_layouts: ResMut<MeshVertexBufferLayouts>,
+    gpu_vlm: Option<Res<GpuVirtualLightmap>>,
     mut views: Query<
         (
             &mut MeshletViewMaterialsMainOpaquePass,
@@ -71,6 +72,7 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
     >,
 ) {
     let fake_vertex_buffer_layout = &fake_vertex_buffer_layout(&mut mesh_vertex_buffer_layouts);
+    let has_virtual_lightmap = gpu_vlm.as_deref().is_some_and(GpuVirtualLightmap::is_ready);
 
     for (
         mut materials,
@@ -114,6 +116,9 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
 
         if has_irradiance_volumes {
             view_key |= MeshPipelineKey::IRRADIANCE_VOLUME;
+        }
+        if has_virtual_lightmap {
+            view_key |= MeshPipelineKey::VIRTUAL_LIGHTMAP;
         }
 
         if let Some(projection) = projection {

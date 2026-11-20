@@ -166,7 +166,7 @@ fn occlusion_cull_screen_aabb(aabb: ScreenAabb, screen: vec2<f32>) -> bool {
     let smax = max_texel >> vec2<u32>(mip);
 
     let curr_depth = sample_hzb(smin, smax, i32(mip));
-    return aabb.max.z <= curr_depth;
+    return aabb.max.z < curr_depth;
 }
 
 fn occlusion_cull_clip_from_local(instance_id: u32) -> mat4x4<f32> {

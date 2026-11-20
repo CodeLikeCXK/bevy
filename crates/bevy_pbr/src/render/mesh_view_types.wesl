@@ -245,3 +245,17 @@ struct ClusteredDecal {
 struct ClusteredDecals {
     decals: array<ClusteredDecal>,
 }
+
+struct VirtualLightmapParams {
+    texel_size_min: f32,
+    level0_max_distance: f32,
+    intensity: f32,
+    sun_shadow_strength: f32,
+    table_mask: u32,
+    search_count: u32,
+    tiles_per_row: u32,
+    level_count: u32,
+    inv_atlas_size: vec2<f32>,
+    direction_blend: f32,
+    _padding: f32,
+}

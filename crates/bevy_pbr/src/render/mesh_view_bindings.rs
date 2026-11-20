@@ -54,6 +54,7 @@ use crate::{
     },
     prepass,
     resources::{AtmosphereBuffer, AtmosphereSampler, AtmosphereTextures, GpuAtmosphere},
+    virtual_lightmap::{self, GpuVirtualLightmap},
     Bluenoise, ExtractedAtmosphere, FogMeta, GlobalClusterableObjectMeta, GpuClusteredLights,
     GpuFog, GpuLights, LightMeta, LightProbesBuffer, LightProbesUniform, MeshPipeline,
     MeshPipelineKey, RenderViewLightProbes, ScreenSpaceAmbientOcclusionResources,
@@ -100,6 +101,7 @@ bitflags::bitflags! {
         const DISTANCE_FOG                     = 1 << 14;
         const AREA_LIGHT_LUTS                  = 1 << 15;
         const VIEW_TRANSMISSION_TEXTURE        = 1 << 16;
+        const VIRTUAL_LIGHTMAP                 = 1 << 17;
     }
 }
 
@@ -183,6 +185,9 @@ impl From<MeshPipelineKey> for MeshPipelineViewLayoutKey {
         if value.contains(MeshPipelineKey::VIEW_TRANSMISSION_TEXTURE) {
             result |= MeshPipelineViewLayoutKey::VIEW_TRANSMISSION_TEXTURE;
         }
+        if value.contains(MeshPipelineKey::VIRTUAL_LIGHTMAP) {
+            result |= MeshPipelineViewLayoutKey::VIRTUAL_LIGHTMAP;
+        }
 
         result
     }
@@ -249,6 +254,7 @@ fn layout_entries(
         environment_map_entries,
         irradiance_volume_entries,
         clustered_decal_entries,
+        virtual_lightmap_entries,
         is_oit_supported,
     }: &MeshPipelineViewLayoutParams,
 ) -> [Vec<BindGroupLayoutEntry>; 2] {
@@ -521,6 +527,16 @@ fn layout_entries(
         ));
     }
 
+    // Virtual Lightmap (surface spatial-hash tile table + hardware 2D atlas)
+    if layout_key.contains(MeshPipelineViewLayoutKey::VIRTUAL_LIGHTMAP) {
+        binding_array_entries = binding_array_entries.extend_with_indices((
+            (8, virtual_lightmap_entries[0]),
+            (9, virtual_lightmap_entries[1]),
+            (10, virtual_lightmap_entries[2]),
+            (11, virtual_lightmap_entries[3]),
+        ));
+    }
+
     [entries.to_vec(), binding_array_entries.to_vec()]
 }
 
@@ -532,6 +548,7 @@ struct MeshPipelineViewLayoutParams {
     environment_map_entries: [BindGroupLayoutEntryBuilder; 3],
     irradiance_volume_entries: [BindGroupLayoutEntryBuilder; 2],
     clustered_decal_entries: Option<[BindGroupLayoutEntryBuilder; 3]>,
+    virtual_lightmap_entries: [BindGroupLayoutEntryBuilder; 4],
     is_oit_supported: bool,
 }
 
@@ -567,6 +584,7 @@ pub fn init_mesh_pipeline_view_layouts(
                 &render_device,
                 &render_adapter,
             ),
+            virtual_lightmap_entries: virtual_lightmap::get_bind_group_layout_entries(),
             is_oit_supported: bevy_core_pipeline::oit::resolve::is_oit_supported(
                 &render_adapter,
                 &render_device,
@@ -686,13 +704,22 @@ pub fn prepare_mesh_view_bind_groups(
         Res<ContactShadowsBuffer>,
         Res<OitBuffers>,
     ),
-    (decals_buffer, render_decals, atmosphere_sampler, blue_noise, area_light_luts, dfg_lut): (
+    (
+        decals_buffer,
+        render_decals,
+        atmosphere_sampler,
+        blue_noise,
+        area_light_luts,
+        dfg_lut,
+        gpu_vlm,
+    ): (
         Res<DecalsBuffer>,
         Res<RenderClusteredDecals>,
         Option<Res<AtmosphereSampler>>,
         Res<Bluenoise>,
         Res<AreaLightLuts>,
         Res<DfgLut>,
+        Option<Res<GpuVirtualLightmap>>,
     ),
     // TODO: Figure out how to reuse the memory. `BindGroupEntry` is non-send on wasm with atomics.
     #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
@@ -1013,6 +1040,19 @@ pub fn prepare_mesh_view_bind_groups(
                     ),
                     // `clustered_decal_sampler`
                     (7, render_view_decal_bind_group_entries.sampler),
+                ));
+            }
+
+            if let Some(gpu_vlm) = gpu_vlm.as_deref()
+                && let Some((params_binding, tile_binding, atlas_view, atlas_sampler)) =
+                    gpu_vlm.bindings(&images)
+            {
+                layout_key |= MeshPipelineViewLayoutKey::VIRTUAL_LIGHTMAP;
+                entries_binding_array = entries_binding_array.extend_with_indices((
+                    (8, params_binding),
+                    (9, tile_binding),
+                    (10, atlas_view),
+                    (11, atlas_sampler),
                 ));
             }
 

@@ -27,6 +27,10 @@ use crate::ao_baker::{bake_vertex_ao, AoBakeConfig, AoBvh, AoOccluderCollector};
 use crate::lod_mesh::{
     build_mesh3d_lod_asset, parse_lod_distances, parse_lod_ratios, save_mesh3d_lod_asset,
 };
+use crate::vlm_baker::{
+    bake_and_save_vlm, estimate_gltf_image_avg_linear_rgb, VlmBakeConfig, VlmMaterialInfo,
+    VlmSceneCollector,
+};
 
 /// 内存异步写入适配器，实现 futures_io::AsyncWrite（供 Bevy AssetSaver 使用）
 pub struct MemoryWriter(pub Vec<u8>);
@@ -63,6 +67,9 @@ pub struct MeshletSceneManifest {
     pub skipped_non_opaque: Vec<SkippedPrimitiveInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub world_hdri: Option<SceneWorldHdri>,
+    /// 离线烘焙的静态表面虚拟光照贴图文件（相对输出目录，如 `<stem>.vlm.bin`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlm_file: Option<String>,
 }
 
 fn default_hdri_strength() -> f32 {
@@ -267,23 +274,31 @@ pub struct SceneExportOptions<'a> {
     pub auto_instance_min: usize,
     /// 静态逐顶点 AO 烘焙参数
     pub ao: AoBakeConfig,
+    /// 静态表面虚拟光照贴图（VLM）离线烘焙参数
+    pub vlm: VlmBakeConfig,
     /// 允许显式 MESH3D_LOD 保留 glTF AlphaMode::Blend（默认自动转为 Mask）
     pub lod_keep_blend: bool,
+    /// 仅离线烘焙静态表面虚拟光照贴图 (.vlm.bin)，跳过贴图导出、逐顶点 AO 与 Meshlet/LOD 网格构建
+    pub vlm_only: bool,
 }
 
 struct SceneContext<'a> {
     buffers: &'a [gltf::buffer::Data],
     exported_tex_paths: &'a [Option<String>],
+    image_avg_colors: &'a [[f32; 3]],
     options: &'a SceneExportOptions<'a>,
     prim_usage_counts: HashMap<(usize, usize), usize>,
     material_map: HashMap<MaterialKey, u32>,
     materials: Vec<SceneMaterial>,
+    vlm_materials: Vec<VlmMaterialInfo>,
     /// 当前活跃静态批次序号：Key = (chunk_id, material_id, cast_shadows)
     active_batch_seq: HashMap<(String, u32, bool), usize>,
     /// 静态 Meshlet 合并池：Key = (chunk_id, material_id, cast_shadows, batch_seq)
     static_batches: HashMap<(String, u32, bool, usize), StaticBatch>,
     /// 除 static_batches 外参与全局静态遮蔽的几何（如自动实例化静态件与不透明 Mesh3d_LOD）
     ao_occluders: AoOccluderCollector,
+    /// 参与静态 VLM 烘焙的全场景静态三角形（带反照率/自发光）
+    vlm_collector: VlmSceneCollector,
     /// 独立/动态 Meshlet 资产去重缓存：Key = (mesh_index, prim_index)
     dynamic_assets_cache: HashMap<(usize, usize), (String, [f32; 3], [f32; 3])>,
     dynamic_instances: Vec<SceneMeshletInstance>,
@@ -308,12 +323,14 @@ pub fn run_scene_export(
     options: &SceneExportOptions<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(options.out_dir)?;
-    let meshes_dir = options.out_dir.join("meshes");
-    std::fs::create_dir_all(&meshes_dir)?;
+    if !options.vlm_only {
+        let meshes_dir = options.out_dir.join("meshes");
+        std::fs::create_dir_all(&meshes_dir)?;
+    }
 
-    // 1. 导出贴图（若启用 --export-textures）
+    // 1. 导出贴图（若启用 --export-textures 且非 --vlm-only）
     let mut exported_tex_paths = vec![None; images.len()];
-    if options.export_textures && !images.is_empty() {
+    if options.export_textures && !options.vlm_only && !images.is_empty() {
         let textures_dir = options.out_dir.join("textures");
         std::fs::create_dir_all(&textures_dir)?;
         println!(
@@ -361,16 +378,28 @@ pub fn run_scene_export(
         }
     }
 
+    let image_avg_colors: Vec<[f32; 3]> = if options.vlm.enabled {
+        images
+            .iter()
+            .map(estimate_gltf_image_avg_linear_rgb)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut ctx = SceneContext {
         buffers,
         exported_tex_paths: &exported_tex_paths,
+        image_avg_colors: &image_avg_colors,
         options,
         prim_usage_counts,
         material_map: HashMap::new(),
         materials: Vec::new(),
+        vlm_materials: Vec::new(),
         active_batch_seq: HashMap::new(),
         static_batches: HashMap::new(),
         ao_occluders: AoOccluderCollector::default(),
+        vlm_collector: VlmSceneCollector::default(),
         dynamic_assets_cache: HashMap::new(),
         dynamic_instances: Vec::new(),
         mesh3d_assets_cache: HashMap::new(),
@@ -417,138 +446,233 @@ pub fn run_scene_export(
         ctx.degenerate_prims_skipped
     );
 
-    // 3. 构建全局静态遮蔽 BVH，并为静态合并批次烘焙逐顶点 AO 后导出 MeshletMesh
+    // 3. 构建全局静态遮蔽 BVH（并同步收集静态批次到 VLM 烘焙收集器）
     let mut final_meshlet_instances = Vec::new();
     let mut sorted_keys: Vec<(String, u32, bool, usize)> = ctx.static_batches.keys().cloned().collect();
     sorted_keys.sort();
 
-    let global_ao_bvh: Option<AoBvh> = if options.ao.is_active() && !sorted_keys.is_empty() {
-        let t_bvh = Instant::now();
-        let mut collector = std::mem::take(&mut ctx.ao_occluders);
+    if options.vlm.enabled {
         for key in &sorted_keys {
             if let Some(batch) = ctx.static_batches.get(key) {
-                collector.push_indexed_mesh(&batch.positions, &batch.indices, None);
+                let mat_info = ctx
+                    .vlm_materials
+                    .get(key.1 as usize)
+                    .copied()
+                    .unwrap_or(VlmMaterialInfo {
+                        diffuse_albedo: [0.5, 0.5, 0.5],
+                        emissive: [0.0, 0.0, 0.0],
+                        double_sided: false,
+                    });
+                ctx.vlm_collector.push_indexed_mesh(
+                    &batch.positions,
+                    &batch.normals,
+                    &batch.indices,
+                    None,
+                    mat_info,
+                );
             }
         }
-        let tri_total = collector.triangle_count();
-        let bvh = collector.build();
-        println!(
-            "\n[4/5] 已构建全局静态 AO BVH（{} 个遮蔽三角面，耗时 {:.2}s），正在并行烘焙逐顶点 AO 并构建 MeshletMesh...",
-            tri_total,
-            t_bvh.elapsed().as_secs_f64()
-        );
-        Some(bvh)
-    } else {
-        println!("\n[4/5] 正在构建并导出 MeshletMesh 静态分块资产...");
-        None
-    };
-
-    for (idx, key) in sorted_keys.iter().enumerate() {
-        let mut batch = ctx.static_batches.remove(key).unwrap();
-        let (chunk, mat_id, cast_shadows, batch_seq) = key;
-        let tri_count = batch.indices.len() / 3;
-        if tri_count == 0 {
-            continue;
-        }
-        println!(
-            "  -> Meshlet 批次 [{}/{}] chunk='{}' mat_id={} shadow={} b={} (顶点: {}, 三角形: {})",
-            idx + 1,
-            sorted_keys.len(),
-            chunk,
-            mat_id,
-            cast_shadows,
-            batch_seq,
-            batch.positions.len(),
-            tri_count
-        );
-
-        // 先在世界空间（与 global_ao_bvh 同坐标系）烘焙静态逐顶点 AO
-        let vertex_ao = global_ao_bvh.as_ref().map(|bvh| {
-            let t_ao = Instant::now();
-            let ao = bake_vertex_ao(bvh, &batch.positions, &batch.normals, options.ao);
-            let min_ao = ao.iter().copied().fold(1.0f32, f32::min);
-            let avg_ao = ao.iter().sum::<f32>() / ao.len().max(1) as f32;
-            println!(
-                "     [AO] 耗时 {:.2}s (avg={:.3}, min={:.3})",
-                t_ao.elapsed().as_secs_f64(),
-                avg_ao,
-                min_ao
-            );
-            ao
-        });
-
-        // 将世界合并坐标平移至批次自身 AABB 中心附近，减小定点量化误差并保证紧凑局部包围盒
-        let batch_center =
-            (Vec3::from_array(batch.aabb_min) + Vec3::from_array(batch.aabb_max)) * 0.5;
-        for p in &mut batch.positions {
-            p[0] -= batch_center.x;
-            p[1] -= batch_center.y;
-            p[2] -= batch_center.z;
-        }
-        let local_aabb_min = [
-            batch.aabb_min[0] - batch_center.x,
-            batch.aabb_min[1] - batch_center.y,
-            batch.aabb_min[2] - batch_center.z,
-        ];
-        let local_aabb_max = [
-            batch.aabb_max[0] - batch_center.x,
-            batch.aabb_max[1] - batch_center.y,
-            batch.aabb_max[2] - batch_center.z,
-        ];
-
-        let mut bevy_mesh =
-            Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-        bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, batch.positions);
-        bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, batch.normals);
-        bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, batch.uvs);
-        bevy_mesh.insert_indices(Indices::U32(batch.indices));
-
-        let t0 = Instant::now();
-        let meshlet_mesh = MeshletMesh::from_mesh_with_ao(
-            &bevy_mesh,
-            options.quantization,
-            vertex_ao.as_deref(),
-        )
-        .map_err(|e| {
-            format!(
-                "静态批次 chunk='{}' mat_id={} b={} 构建 Meshlet 失败: {:?}",
-                chunk, mat_id, batch_seq, e
-            )
-        })?;
-
-        let safe_chunk = sanitize_filename(chunk);
-        let shadow_tag = if *cast_shadows { "" } else { "_noshadow" };
-        let rel_mesh_path = format!(
-            "meshes/{}_chunk_{}_mat_{}{}_b{}.meshlet_mesh",
-            options.input_stem, safe_chunk, mat_id, shadow_tag, batch_seq
-        );
-        let abs_mesh_path = options.out_dir.join(&rel_mesh_path);
-        save_meshlet_mesh(&meshlet_mesh, &abs_mesh_path)?;
-        println!(
-            "     完成，耗时 {:.2}s -> {}",
-            t0.elapsed().as_secs_f64(),
-            rel_mesh_path
-        );
-
-        final_meshlet_instances.push(SceneMeshletInstance {
-            name: format!("static_{}_mat_{}{}_b{}", safe_chunk, mat_id, shadow_tag, batch_seq),
-            chunk: chunk.clone(),
-            mesh: rel_mesh_path,
-            material_id: *mat_id,
-            translation: batch_center.to_array(),
-            rotation: [0.0, 0.0, 0.0, 1.0],
-            scale: [1.0, 1.0, 1.0],
-            aabb_min: local_aabb_min,
-            aabb_max: local_aabb_max,
-            dynamic: false,
-            cast_shadows: *cast_shadows,
-        });
     }
 
-    final_meshlet_instances.extend(ctx.dynamic_instances);
+    if !options.vlm_only {
+        let global_ao_bvh: Option<AoBvh> = if options.ao.is_active() && !sorted_keys.is_empty() {
+            let t_bvh = Instant::now();
+            let mut collector = std::mem::take(&mut ctx.ao_occluders);
+            for key in &sorted_keys {
+                if let Some(batch) = ctx.static_batches.get(key) {
+                    collector.push_indexed_mesh(&batch.positions, &batch.indices, None);
+                }
+            }
+            let tri_total = collector.triangle_count();
+            let bvh = collector.build();
+            println!(
+                "\n[4/5] 已构建全局静态 AO BVH（{} 个遮蔽三角面，耗时 {:.2}s），正在并行烘焙逐顶点 AO 并构建 MeshletMesh...",
+                tri_total,
+                t_bvh.elapsed().as_secs_f64()
+            );
+            Some(bvh)
+        } else {
+            println!("\n[4/5] 正在构建并导出 MeshletMesh 静态分块资产...");
+            None
+        };
+
+        for (idx, key) in sorted_keys.iter().enumerate() {
+            let mut batch = ctx.static_batches.remove(key).unwrap();
+            let (chunk, mat_id, cast_shadows, batch_seq) = key;
+            let tri_count = batch.indices.len() / 3;
+            if tri_count == 0 {
+                continue;
+            }
+            println!(
+                "  -> Meshlet 批次 [{}/{}] chunk='{}' mat_id={} shadow={} b={} (顶点: {}, 三角形: {})",
+                idx + 1,
+                sorted_keys.len(),
+                chunk,
+                mat_id,
+                cast_shadows,
+                batch_seq,
+                batch.positions.len(),
+                tri_count
+            );
+
+            // 先在世界空间（与 global_ao_bvh 同坐标系）烘焙静态逐顶点 AO
+            let vertex_ao = global_ao_bvh.as_ref().map(|bvh| {
+                let t_ao = Instant::now();
+                let ao = bake_vertex_ao(bvh, &batch.positions, &batch.normals, options.ao);
+                let min_ao = ao.iter().copied().fold(1.0f32, f32::min);
+                let avg_ao = ao.iter().sum::<f32>() / ao.len().max(1) as f32;
+                println!(
+                    "     [AO] 耗时 {:.2}s (avg={:.3}, min={:.3})",
+                    t_ao.elapsed().as_secs_f64(),
+                    avg_ao,
+                    min_ao
+                );
+                ao
+            });
+
+            // 将世界合并坐标平移至批次自身 AABB 中心附近，减小定点量化误差并保证紧凑局部包围盒
+            let batch_center =
+                (Vec3::from_array(batch.aabb_min) + Vec3::from_array(batch.aabb_max)) * 0.5;
+            for p in &mut batch.positions {
+                p[0] -= batch_center.x;
+                p[1] -= batch_center.y;
+                p[2] -= batch_center.z;
+            }
+            let local_aabb_min = [
+                batch.aabb_min[0] - batch_center.x,
+                batch.aabb_min[1] - batch_center.y,
+                batch.aabb_min[2] - batch_center.z,
+            ];
+            let local_aabb_max = [
+                batch.aabb_max[0] - batch_center.x,
+                batch.aabb_max[1] - batch_center.y,
+                batch.aabb_max[2] - batch_center.z,
+            ];
+
+            let mut bevy_mesh =
+                Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+            bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, batch.positions);
+            bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, batch.normals);
+            bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, batch.uvs);
+            bevy_mesh.insert_indices(Indices::U32(batch.indices));
+
+            let t0 = Instant::now();
+            let meshlet_mesh = MeshletMesh::from_mesh_with_ao(
+                &bevy_mesh,
+                options.quantization,
+                vertex_ao.as_deref(),
+            )
+            .map_err(|e| {
+                format!(
+                    "静态批次 chunk='{}' mat_id={} b={} 构建 Meshlet 失败: {:?}",
+                    chunk, mat_id, batch_seq, e
+                )
+            })?;
+
+            let safe_chunk = sanitize_filename(chunk);
+            let shadow_tag = if *cast_shadows { "" } else { "_noshadow" };
+            let rel_mesh_path = format!(
+                "meshes/{}_chunk_{}_mat_{}{}_b{}.meshlet_mesh",
+                options.input_stem, safe_chunk, mat_id, shadow_tag, batch_seq
+            );
+            let abs_mesh_path = options.out_dir.join(&rel_mesh_path);
+            save_meshlet_mesh(&meshlet_mesh, &abs_mesh_path)?;
+            println!(
+                "     完成，耗时 {:.2}s -> {}",
+                t0.elapsed().as_secs_f64(),
+                rel_mesh_path
+            );
+
+            final_meshlet_instances.push(SceneMeshletInstance {
+                name: format!("static_{}_mat_{}{}_b{}", safe_chunk, mat_id, shadow_tag, batch_seq),
+                chunk: chunk.clone(),
+                mesh: rel_mesh_path,
+                material_id: *mat_id,
+                translation: batch_center.to_array(),
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0, 1.0, 1.0],
+                aabb_min: local_aabb_min,
+                aabb_max: local_aabb_max,
+                dynamic: false,
+                cast_shadows: *cast_shadows,
+            });
+        }
+
+        final_meshlet_instances.extend(ctx.dynamic_instances);
+    } else {
+        ctx.static_batches.clear();
+        println!("\n[4/5] 仅烘焙 VLM 模式 (--vlm-only)，已跳过 MeshletMesh/LOD 与顶点 AO 构建。");
+    }
 
     // 4. 提取场景 World HDRI 配置（优先读取 glTF scene.extras，其次读旁路 .bevy_hdri.json）并随场景打包
     let world_hdri = extract_and_bundle_world_hdri(&document, options);
+
+    // 4.5 离线烘焙静态表面虚拟光照贴图（VLM SpatialHash Tile -> <stem>.vlm.bin）
+    let vlm_file = if options.vlm.enabled && ctx.vlm_collector.triangle_count() > 0 {
+        println!("\n[4.5/5] 正在离线路径追踪烘焙静态表面 Virtual Lightmap (.vlm.bin)...");
+        let rel_vlm = format!("{}.vlm.bin", options.input_stem);
+        let abs_vlm = options.out_dir.join(&rel_vlm);
+        match bake_and_save_vlm(
+            ctx.vlm_collector,
+            &ctx.lights,
+            world_hdri.as_ref(),
+            options.out_dir,
+            &abs_vlm,
+            options.vlm,
+        ) {
+            Ok(_report) => Some(rel_vlm),
+            Err(err) => {
+                eprintln!("  [警告] VLM 烘焙失败（已跳过，不影响 Meshlet 场景导出）: {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if options.vlm_only {
+        let manifest_path = options
+            .out_dir
+            .join(format!("{}.meshlet_scene.json", options.input_stem));
+        if manifest_path.is_file()
+            && let Ok(existing_bytes) = std::fs::read(&manifest_path)
+            && let Ok(mut existing_manifest) =
+                serde_json::from_slice::<MeshletSceneManifest>(&existing_bytes)
+        {
+            existing_manifest.vlm_file = vlm_file.clone();
+            if existing_manifest.world_hdri.is_none() {
+                existing_manifest.world_hdri = world_hdri.clone();
+            }
+            let json_str = serde_json::to_string_pretty(&existing_manifest)?;
+            std::fs::write(&manifest_path, json_str)?;
+            println!(
+                "\n[5/5] 已无损更新现有场景清单的 vlm_file 字段: {}",
+                manifest_path.display()
+            );
+        } else {
+            println!(
+                "\n[5/5] 输出目录未找到现有清单 {}，已仅生成 .vlm.bin。",
+                manifest_path.display()
+            );
+        }
+
+        println!("\n=======================================================");
+        println!("VLM 独立烘焙完成！(--vlm-only)");
+        if let Some(hdri) = &world_hdri {
+            println!(
+                "  World HDRI: {} (strength={:.2}, yaw={:.1}°)",
+                hdri.image, hdri.strength, hdri.yaw_degrees
+            );
+        }
+        if let Some(vlm) = &vlm_file {
+            println!("  Virtual Lightmap: {}", options.out_dir.join(vlm).display());
+        } else {
+            println!("  Virtual Lightmap: 未生成（场景无可用静态几何或烘焙失败）");
+        }
+        println!("=======================================================");
+
+        return Ok(());
+    }
 
     // 5. 写入场景清单 JSON
     println!("\n[5/5] 正在生成场景清单 (.meshlet_scene.json)...");
@@ -567,6 +691,7 @@ pub fn run_scene_export(
         gameplay_markers: ctx.gameplay_markers,
         skipped_non_opaque: ctx.skipped_non_opaque,
         world_hdri,
+        vlm_file,
     };
 
     let manifest_path = options
@@ -588,6 +713,9 @@ pub fn run_scene_export(
             "  World HDRI: {} (strength={:.2}, yaw={:.1}°)",
             hdri.image, hdri.strength, hdri.yaw_degrees
         );
+    }
+    if let Some(vlm) = &manifest.vlm_file {
+        println!("  Virtual Lightmap: {}", vlm);
     }
     println!("=======================================================");
 
@@ -933,13 +1061,38 @@ fn visit_node(
                     .collect::<Vec<_>>()
                     .join("_");
 
-                if ctx.options.ao.is_active()
+                if (ctx.options.ao.is_active() || ctx.options.vlm.enabled)
                     && alpha_mode == gltf::material::AlphaMode::Opaque
                     && !is_dynamic_by_prefix
                     && tags.bevy_tag != "MESHLET_DYN"
                 {
-                    ctx.ao_occluders
-                        .push_indexed_mesh(&positions, &indices, Some(&world));
+                    if ctx.options.ao.is_active() {
+                        ctx.ao_occluders
+                            .push_indexed_mesh(&positions, &indices, Some(&world));
+                    }
+                    if ctx.options.vlm.enabled {
+                        let local_n = ensure_local_normals(&positions, normals.as_deref(), &indices);
+                        let mat_info = ctx
+                            .vlm_materials
+                            .get(mat_id as usize)
+                            .copied()
+                            .unwrap_or(VlmMaterialInfo {
+                                diffuse_albedo: [0.5, 0.5, 0.5],
+                                emissive: [0.0, 0.0, 0.0],
+                                double_sided: false,
+                            });
+                        ctx.vlm_collector.push_indexed_mesh(
+                            &positions,
+                            &local_n,
+                            &indices,
+                            Some(&world),
+                            mat_info,
+                        );
+                    }
+                }
+
+                if ctx.options.vlm_only {
+                    continue;
                 }
 
                 let cache_key = (mesh.index(), prim_idx, ratios_sig.clone());
@@ -1032,10 +1185,36 @@ fn visit_node(
                     ctx.auto_instanced_count += 1;
                 }
                 let is_dynamic_instance = is_dynamic_by_prefix || tags.bevy_tag == "MESHLET_DYN";
-                if ctx.options.ao.is_active() && !is_dynamic_instance {
-                    ctx.ao_occluders
-                        .push_indexed_mesh(&positions, &indices, Some(&world));
+                if !is_dynamic_instance {
+                    if ctx.options.ao.is_active() {
+                        ctx.ao_occluders
+                            .push_indexed_mesh(&positions, &indices, Some(&world));
+                    }
+                    if ctx.options.vlm.enabled {
+                        let local_n = ensure_local_normals(&positions, normals.as_deref(), &indices);
+                        let mat_info = ctx
+                            .vlm_materials
+                            .get(mat_id as usize)
+                            .copied()
+                            .unwrap_or(VlmMaterialInfo {
+                                diffuse_albedo: [0.5, 0.5, 0.5],
+                                emissive: [0.0, 0.0, 0.0],
+                                double_sided: false,
+                            });
+                        ctx.vlm_collector.push_indexed_mesh(
+                            &positions,
+                            &local_n,
+                            &indices,
+                            Some(&world),
+                            mat_info,
+                        );
+                    }
                 }
+
+                if ctx.options.vlm_only {
+                    continue;
+                }
+
                 let key = (mesh.index(), prim_idx);
                 let (rel_mesh_path, aabb_min, aabb_max) =
                     if let Some(cached) = ctx.dynamic_assets_cache.get(&key) {
@@ -1283,7 +1462,7 @@ fn register_or_get_material(
         idx.and_then(|i| ctx.exported_tex_paths.get(i).cloned().flatten())
     };
 
-    ctx.materials.push(SceneMaterial {
+    let scene_mat = SceneMaterial {
         id,
         name: gltf_mat
             .name()
@@ -1302,7 +1481,11 @@ fn register_or_get_material(
         emissive_texture: tex_path(emissive_tex),
         double_sided,
         wrap_mode: [wrap_u_str, wrap_v_str],
-    });
+    };
+    let tex_avg = base_color_tex.and_then(|i| ctx.image_avg_colors.get(i).copied());
+    ctx.vlm_materials
+        .push(VlmMaterialInfo::from_scene_material(&scene_mat, tex_avg));
+    ctx.materials.push(scene_mat);
     ctx.material_map.insert(key, id);
     id
 }

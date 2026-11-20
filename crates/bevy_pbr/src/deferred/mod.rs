@@ -263,6 +263,10 @@ impl SpecializedRenderPipeline for DeferredLightingLayout {
             shader_defs.push("IRRADIANCE_VOLUME".into());
         }
 
+        if key.contains(MeshPipelineKey::VIRTUAL_LIGHTMAP) {
+            shader_defs.push("VIRTUAL_LIGHTMAP".into());
+        }
+
         if key.contains(MeshPipelineKey::NORMAL_PREPASS) {
             shader_defs.push("NORMAL_PREPASS".into());
         }

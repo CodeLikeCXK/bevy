@@ -5,6 +5,7 @@ mod lod_loader;
 mod scene_loader;
 mod skybox;
 mod streaming;
+mod vlm;
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +37,7 @@ use lod_loader::Mesh3dLodPlugin;
 use scene_loader::{find_manifest_path, MeshletSceneConfig, MeshletSceneManifest, MeshletScenePlugin, SceneWorldHdri};
 use skybox::{SkyboxConfig, SkyboxScenePlugin};
 use streaming::{StreamingConfig, StreamingPlugin};
+use vlm::{find_vlm_file_in_dir, VlmConfig, VlmScenePlugin};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -191,6 +193,22 @@ struct Cli {
     /// 3D 场景内部分辨率缩放比例 (0.25..=1.0)，低于 1.0 时先渲染到缩放 RT 再全屏双线性放大（HUD 保持原生清晰度）
     #[arg(long, default_value_t = 1.0)]
     render_scale: f32,
+
+    /// 禁用自动加载场景附带的预构建 Virtual Lightmap (.vlm.bin)
+    #[arg(long, default_value_t = false)]
+    no_vlm: bool,
+
+    /// 可选显式覆盖 Virtual Lightmap (.vlm.bin) 路径（未指定时自动随场景清单或场景目录加载，无需额外参数）
+    #[arg(long)]
+    vlm: Option<String>,
+
+    /// Virtual Lightmap 烘焙漫反射强度倍率（默认 1.0，运行时可按 ; / ' 微调）
+    #[arg(long, default_value_t = 1.0)]
+    vlm_intensity: f32,
+
+    /// 即使启用了 VLM 也强制静态场景继续投射实时 CSM 阴影（默认关闭以省去静态高模阴影光栅化开销，仅动态角色投射实时阴影）
+    #[arg(long, default_value_t = false)]
+    static_realtime_shadows: bool,
 }
 
 #[derive(Resource, Clone)]
@@ -250,11 +268,20 @@ fn resolve_external_asset_source(app: &mut App, raw_path: &str, source_name: &st
     raw_path.to_string()
 }
 
-fn peek_manifest_world_hdri(scene_dir: &Path, manifest_file: Option<&str>) -> Option<SceneWorldHdri> {
-    let manifest_path = find_manifest_path(scene_dir, manifest_file)?;
-    let bytes = std::fs::read(manifest_path).ok()?;
-    let manifest: MeshletSceneManifest = serde_json::from_slice(&bytes).ok()?;
-    manifest.world_hdri
+fn peek_manifest_extras(
+    scene_dir: &Path,
+    manifest_file: Option<&str>,
+) -> (Option<SceneWorldHdri>, Option<String>) {
+    let Some(manifest_path) = find_manifest_path(scene_dir, manifest_file) else {
+        return (None, None);
+    };
+    let Ok(bytes) = std::fs::read(manifest_path) else {
+        return (None, None);
+    };
+    let Ok(manifest) = serde_json::from_slice::<MeshletSceneManifest>(&bytes) else {
+        return (None, None);
+    };
+    (manifest.world_hdri, manifest.vlm_file)
 }
 
 /// 优先解析为 `meshlet_scene://` 相对路径，其次通过外部文件源或内置 `assets/` 加载
@@ -287,10 +314,33 @@ fn main() {
     let meta_asset_path =
         resolve_external_asset_source(&mut app, &cli.irradiance_meta, "irradiance_meta_src");
 
+    let (manifest_hdri_raw, manifest_vlm_file) =
+        peek_manifest_extras(&cli.scene_dir, cli.manifest.as_deref());
     let manifest_hdri = if cli.no_skybox {
         None
     } else {
-        peek_manifest_world_hdri(&cli.scene_dir, cli.manifest.as_deref())
+        manifest_hdri_raw
+    };
+
+    // 自动随场景发现并读取预构建 Virtual Lightmap（无需额外命令行参数）：
+    // 优先 --vlm 覆盖 -> 清单中的 vlm_file -> 自动扫描 scene_dir 下的 *.vlm.bin
+    let raw_vlm_path = if cli.no_vlm {
+        None
+    } else {
+        cli.vlm
+            .clone()
+            .or(manifest_vlm_file)
+            .or_else(|| find_vlm_file_in_dir(&cli.scene_dir))
+    };
+    let vlm_asset_path = raw_vlm_path.as_deref().map(|p| {
+        resolve_scene_or_external_asset(&mut app, &cli.scene_dir, p, "vlm_external_src")
+    });
+    let vlm_active = vlm_asset_path.is_some();
+    let vlm_config = VlmConfig {
+        asset_path: vlm_asset_path,
+        enabled: vlm_active,
+        intensity: cli.vlm_intensity,
+        ..default()
     };
     let raw_skybox_path = if cli.no_skybox {
         None
@@ -385,12 +435,15 @@ fn main() {
         light_intensity_scale: cli.light_intensity_scale,
         default_sun_illuminance: cli.default_sun_illuminance,
         default_point_lumens: cli.default_point_lumens,
+        vlm_active,
+        static_realtime_shadows: cli.static_realtime_shadows,
     })
     .insert_resource(IrradianceConfig {
         ktx2_asset_path,
         meta_asset_path,
         intensity: cli.irradiance_intensity,
     })
+    .insert_resource(vlm_config)
     .insert_resource(skybox_config)
     .insert_resource(StreamingConfig {
         enabled: !cli.no_streaming,
@@ -441,6 +494,7 @@ fn main() {
             MeshletScenePlugin,
             Mesh3dLodPlugin,
             IrradianceScenePlugin,
+            VlmScenePlugin,
             SkyboxScenePlugin,
             StreamingPlugin,
             CharacterActionStubPlugin,

@@ -21,7 +21,6 @@ use bevy_render::{
     view::{ExtractedView, ViewUniform, ViewUniforms},
 };
 use binding_types::*;
-use core::iter;
 
 /// Manages per-view and per-cluster GPU resources for [`MeshletPlugin`](`super::MeshletPlugin`).
 #[derive(Resource)]
@@ -571,6 +570,12 @@ pub fn prepare_meshlet_per_frame_resources(
                 buffer.set_label(Some("meshlet_view_instance_visibility"));
                 buffer
             });
+        let word_count = (instance_manager.scene_instance_count as usize)
+            .div_ceil(32)
+            .max(1);
+        let vec = instance_visibility.get_mut();
+        vec.clear();
+        vec.resize(word_count, 0);
         for (instance_index, (_, layers, not_shadow_caster)) in
             instance_manager.instances.iter().enumerate()
         {
@@ -581,12 +586,8 @@ pub fn prepare_meshlet_per_frame_resources(
                 .intersects(layers)
                 || (shadow_view.is_some() && *not_shadow_caster)
             {
-                let vec = instance_visibility.get_mut();
                 let index = instance_index / 32;
                 let bit = instance_index - index * 32;
-                if vec.len() <= index {
-                    vec.extend(iter::repeat_n(0, index - vec.len() + 1));
-                }
                 vec[index] |= 1 << bit;
             }
         }

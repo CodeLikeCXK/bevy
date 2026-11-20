@@ -39,3 +39,6 @@ ci-integration-test-clean = "ci integration-test-clean"
 ci-integration-test-run = "ci integration-test"
 ci-lints = "ci lints"
 ci-test = "ci test"
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+neon,+fp16,+dotprod"]

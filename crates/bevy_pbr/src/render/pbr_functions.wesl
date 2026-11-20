@@ -26,6 +26,7 @@ import bevy_render::maths::{E, powsafe};
 @if(STANDARD_MATERIAL_SPECULAR_TRANSMISSION) import package::transmission;
 
 @if(IRRADIANCE_VOLUME) import package::light_probe::irradiance_volume;
+@if(VIRTUAL_LIGHTMAP) import package::light_probe::virtual_lightmap;
 
 @if(MESHLET_MESH_MATERIAL_PASS) import package::meshlet::visibility_buffer_resolve::VertexOutput;
 @elif(PREPASS_PIPELINE) import package::prepass::io::VertexOutput;
@@ -459,6 +460,21 @@ fn apply_pbr_lighting(
     @if(CONTACT_SHADOWS)
     let contact_shadow_enabled = contact_shadow_steps > 0u;
 
+    var vlm_irradiance = vec3<f32>(0.0);
+    var vlm_sun_shadow = 1.0f;
+    var vlm_coverage = 0.0f;
+    @if(VIRTUAL_LIGHTMAP) {
+        let vlm_view_dist = length(view_bindings::view.world_position.xyz - in.world_position.xyz);
+        let vlm_sample = virtual_lightmap::sample_virtual_lightmap(
+            in.world_position.xyz,
+            normalize(in.world_normal),
+            vlm_view_dist,
+        );
+        vlm_irradiance = vlm_sample.irradiance;
+        vlm_sun_shadow = vlm_sample.sun_shadow;
+        vlm_coverage = vlm_sample.coverage;
+    }
+
     // Point lights (direct)
     for (var i: u32 = clusterable_object_index_ranges.first_point_light_index_offset;
             i < clusterable_object_index_ranges.first_spot_light_index_offset;
@@ -468,11 +484,18 @@ fn apply_pbr_lighting(
         // If we're lightmapped, disable diffuse contribution from the light if
         // requested, to avoid double-counting light.
         @if(LIGHTMAP)
-        let enable_diffuse =
+        var enable_diffuse =
             (view_bindings::clustered_lights.data[light_id].flags &
                 mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u;
         @else   // LIGHTMAP
-        let enable_diffuse = true;
+        var enable_diffuse = true;
+        @if(VIRTUAL_LIGHTMAP) {
+            if (vlm_coverage > 0.5) {
+                enable_diffuse = enable_diffuse &&
+                    ((view_bindings::clustered_lights.data[light_id].flags &
+                        mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u);
+            }
+        }
 
         var shadow: f32 = 1.0;
         if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
@@ -522,11 +545,18 @@ fn apply_pbr_lighting(
         // If we're lightmapped, disable diffuse contribution from the light if
         // requested, to avoid double-counting light.
         @if(LIGHTMAP)
-        let enable_diffuse =
+        var enable_diffuse =
             (view_bindings::clustered_lights.data[light_id].flags &
                 mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u;
         @else   // LIGHTMAP
-        let enable_diffuse = true;
+        var enable_diffuse = true;
+        @if(VIRTUAL_LIGHTMAP) {
+            if (vlm_coverage > 0.5) {
+                enable_diffuse = enable_diffuse &&
+                    ((view_bindings::clustered_lights.data[light_id].flags &
+                        mesh_view_types::POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT) != 0u);
+            }
+        }
 
         var shadow: f32 = 1.0;
         if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
@@ -581,6 +611,7 @@ fn apply_pbr_lighting(
     }
 
     // directional lights (direct)
+    var debug_realtime_sun_shadow = 1.0f;
     let n_directional_lights = view_bindings::lights.n_directional_lights;
     for (var i: u32 = 0u; i < n_directional_lights; i = i + 1u) {
         // check if this light should be skipped, which occurs if this light does not intersect with the view
@@ -598,10 +629,19 @@ fn apply_pbr_lighting(
         let enable_diffuse = true;
 
         var shadow: f32 = 1.0;
-        if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
-                && (view_bindings::lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
-            shadow = shadows::fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.frag_coord.xy);
+        if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u) {
+            if ((view_bindings::lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+                shadow = shadows::fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.frag_coord.xy);
+            }
             shadow *= in.directional_shadow_factor;
+            if (i == 0u) {
+                debug_realtime_sun_shadow = shadow;
+            }
+            @if(VIRTUAL_LIGHTMAP) {
+                if (i == 0u && vlm_coverage > 0.5) {
+                    shadow = min(shadow, vlm_sun_shadow);
+                }
+            }
         }
 
         @if(CONTACT_SHADOWS && DEPTH_PREPASS)
@@ -704,9 +744,17 @@ fn apply_pbr_lighting(
     found_diffuse_indirect = true;
 }
 
+    var vlm_diffuse_blend = 0.0f;
+@if(VIRTUAL_LIGHTMAP) {
+    if (!found_diffuse_indirect && vlm_coverage > 0.0) {
+        vlm_diffuse_blend = saturate(vlm_coverage);
+        indirect_light += vlm_irradiance * diffuse_color * diffuse_occlusion * vlm_diffuse_blend;
+    }
+}
+
     @if(IRRADIANCE_VOLUME)
     // Irradiance volume light (indirect)
-    if (!found_diffuse_indirect) {
+    if (!found_diffuse_indirect && vlm_diffuse_blend < 0.999) {
         let vxgi = irradiance_volume::irradiance_volume_sample(
             in.world_position.xyz,
             in.N,
@@ -770,7 +818,7 @@ fn apply_pbr_lighting(
     let sky_share = saturate(sky_luma / max(sky_luma + vxgi_luma_scaled, 1e-4f));
     vxgi_coop_weight = mix(1.0f, mix(0.95f, 0.52f, sky_diffuse_weight * sky_share), vxgi_weight);
 
-    indirect_light += sky_diffuse;
+    indirect_light += sky_diffuse * (1.0 - vlm_diffuse_blend);
     if (!use_ssr) {
         let ibl_spec = environment_light.specular * specular_occlusion;
         indirect_light += ibl_spec;
@@ -780,7 +828,7 @@ fn apply_pbr_lighting(
     }
 }
 
-    indirect_light += vxgi_diffuse * vxgi_coop_weight;
+    indirect_light += vxgi_diffuse * vxgi_coop_weight * (1.0 - vlm_diffuse_blend);
 
     // Ambient light (indirect)
     // If we are lightmapped, disable the ambient contribution if requested.
@@ -885,6 +933,31 @@ fn apply_pbr_lighting(
 
     @if(AO_DEBUG_IBL_SPECULAR_ONLY) {
         output_color = vec4<f32>(view_bindings::view.exposure * debug_ibl_specular, output_color.a);
+    } @elif(AO_DEBUG_VLM_IRRADIANCE) {
+        @if(VIRTUAL_LIGHTMAP) {
+            if (vlm_coverage > 0.5) {
+                output_color = vec4<f32>(view_bindings::view.exposure * vlm_irradiance, output_color.a);
+            } else {
+                output_color = vec4<f32>(1.0, 0.0, 0.75, output_color.a);
+            }
+        } @else {
+            output_color = vec4<f32>(0.05, 0.06, 0.12, output_color.a);
+        }
+    } @elif(AO_DEBUG_VLM_SUN_SHADOW) {
+        @if(VIRTUAL_LIGHTMAP) {
+            if (vlm_coverage > 0.5) {
+                let combined_shadow = min(debug_realtime_sun_shadow, vlm_sun_shadow);
+                // Show baked soft shadow in neutral grayscale; tint dynamic character shadow regions slightly cyan.
+                let rt_only_mask = saturate(vlm_sun_shadow - debug_realtime_sun_shadow);
+                let col = mix(vec3<f32>(combined_shadow), vec3<f32>(0.08, 0.55, 0.85), rt_only_mask * 0.8);
+                output_color = vec4<f32>(col, output_color.a);
+            } else {
+                // Uncovered dynamic object: show real-time shadow with subtle warm tint.
+                output_color = vec4<f32>(vec3<f32>(debug_realtime_sun_shadow) * vec3<f32>(1.0, 0.82, 0.55), output_color.a);
+            }
+        } @else {
+            output_color = vec4<f32>(vec3<f32>(debug_realtime_sun_shadow), output_color.a);
+        }
     } @else {
         // Total light
         output_color = vec4<f32>(

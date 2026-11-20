@@ -28,6 +28,12 @@ import package::meshlet::visibility_buffer_resolve::resolve_vertex_output;
 @if(MESHLET_MESH_MATERIAL_PASS && AO_DEBUG_MESHLET_CLUSTERS)
 import package::render::utils::rand_f;
 
+@if(!PREPASS_PIPELINE && VIRTUAL_LIGHTMAP && AO_DEBUG_VLM_TILES)
+import package::{
+    light_probe::virtual_lightmap,
+    render::mesh_view_bindings::view,
+};
+
 @if(MATERIAL_OIT_ENABLED)
 import bevy_core_pipeline::oit::draw::oit_draw;
 
@@ -105,6 +111,18 @@ fn fragment(
         } @else {
             let shade = 0.75 + 0.25 * saturate(dot(pbr_input.N, normalize(vec3<f32>(0.4, 1.0, 0.3))));
             out.color = vec4<f32>(vec3<f32>(0.08, 0.09, 0.12) * shade, pbr_input.material.base_color.a);
+        }
+    } @elif(AO_DEBUG_VLM_TILES) {
+        @if(VIRTUAL_LIGHTMAP) {
+            let dist = length(view.world_position.xyz - pbr_input.world_position.xyz);
+            let tile_col = virtual_lightmap::virtual_lightmap_debug_tile_color(
+                pbr_input.world_position.xyz,
+                normalize(pbr_input.world_normal),
+                dist,
+            );
+            out.color = vec4<f32>(tile_col, pbr_input.material.base_color.a);
+        } @else {
+            out.color = vec4<f32>(vec3<f32>(0.08, 0.09, 0.12), pbr_input.material.base_color.a);
         }
     } @else {
         if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {

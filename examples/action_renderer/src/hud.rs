@@ -27,6 +27,7 @@ use crate::{
     scene_loader::MeshletSceneConfig,
     skybox::{SkyboxConfig, SkyboxStatus},
     streaming::{Mesh3dLodTris, SceneChunk},
+    vlm::VlmStatus,
     RenderResolutionConfig,
 };
 
@@ -204,6 +205,7 @@ fn update_hud_text(
     scene_config: Res<MeshletSceneConfig>,
     shadow_map: Res<DirectionalLightShadowMap>,
     irradiance_config: Res<IrradianceConfig>,
+    vlm_status: Res<VlmStatus>,
     skybox_config: Res<SkyboxConfig>,
     skybox_status: Res<SkyboxStatus>,
     stats_cache: Res<MeshletAssetStatsCache>,
@@ -351,12 +353,37 @@ fn update_hud_text(
         )
     };
 
+    let vlm_state = if vlm_status.loaded {
+        format!(
+            "{} ({} tiles, {}x{}, {:.0}cm, {:.2}x)",
+            if vlm_status.enabled { "ON" } else { "OFF" },
+            format_compact_count(vlm_status.used_tiles as usize),
+            vlm_status.atlas_size.x,
+            vlm_status.atlas_size.y,
+            vlm_status.texel_size_cm,
+            vlm_status.intensity,
+        )
+    } else if scene_config.vlm_active {
+        "Loading...".to_string()
+    } else {
+        "None".to_string()
+    };
+
     let view_legend = match debug_view {
         AoDebugView::MeshletClusters => {
             "\nCluster View: Random color per Meshlet cluster (Mesh3d = dark gray)"
         }
         AoDebugView::MeshletTriangleDensity => {
             "\nTri Area: <=0.25px2 Magenta | 1px2 Red | 4px2 Yellow | 16px2 Green | 64+px2 Blue"
+        }
+        AoDebugView::VlmIrradiance => {
+            "\nVLM GI View: Baked static diffuse irradiance (Magenta = uncovered hole)"
+        }
+        AoDebugView::VlmSunShadowMask => {
+            "\nVLM Sun Shadow: Grayscale = baked soft shadow | Cyan = dynamic char shadow"
+        }
+        AoDebugView::VlmTiles => {
+            "\nVLM Tiles: Colored 8x8 SpatialHash tiles + texel checker (Magenta = hole)"
         }
         _ => "",
     };
@@ -379,17 +406,18 @@ fn update_hud_text(
 
     text.0 = format!(
         "FPS: {:.1} (avg {:.1}) | Frame: {:.1} ms | Res: {} | View: {}\n\
-         {}\n\
+         {} | VLM: {}\n\
          Lights: Dir {} (Shadow {}) | Local {}/{} | GI: {} | Sky: {}\n\
          Chunks: {}/{} | Meshlet: {} inst, {} clusters ({} pool tris)\n\
          Mesh3d LOD: {}/{} visible ({} tris) | Total Pool Tris: {}\n\
-         [F3] HUD  [F4] View  [Space] GI  [[ / ]] GI±  [B] Sky  [- / =] Env±{}",
+         [F3] HUD  [F4] View  [V] VLM  [; / '] VLM±  [Space] GI  [[ / ]] GI±  [B] Sky  [- / =] Env±{}",
         fps_cur,
         fps_avg,
         frame_ms,
         res_label,
         debug_view_label,
         shadow_line,
+        vlm_state,
         dir_total,
         dir_shadow_count,
         local_active,

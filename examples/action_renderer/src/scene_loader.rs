@@ -40,6 +40,8 @@ pub struct MeshletSceneManifest {
     pub skipped_non_opaque: Vec<serde_json::Value>,
     #[serde(default)]
     pub world_hdri: Option<SceneWorldHdri>,
+    #[serde(default)]
+    pub vlm_file: Option<String>,
 }
 
 fn default_hdri_strength() -> f32 {
@@ -203,6 +205,10 @@ pub struct MeshletSceneConfig {
     pub default_sun_illuminance: f32,
     /// Point/Spot 导出强度 <= 0.01 时的兜底流明 (lumens)
     pub default_point_lumens: f32,
+    /// 是否检测到并启用了预构建 Virtual Lightmap（自动开启静态场景实时阴影减负与 Stationary 局部光模式）
+    pub vlm_active: bool,
+    /// 即使启用了 VLM 也强制静态物体继续投射实时 CSM 阴影（默认 false 以最大化 60fps 性能）
+    pub static_realtime_shadows: bool,
 }
 
 /// 挂在场景局部光源（Point/Spot）上，供运行时按相机距离平滑渐入/渐出激活，避免硬切换跳变
@@ -410,13 +416,18 @@ fn setup_meshlet_scene(
                 Vec3::from_array(inst.aabb_max),
             );
 
+            let static_casts_realtime_shadow = !config.vlm_active || config.static_realtime_shadows;
+            let cast_shadows = config.shadows_enabled
+                && inst.cast_shadows
+                && (inst.dynamic || static_casts_realtime_shadow);
+
             let acc = chunk_map.entry(inst.chunk.clone()).or_default();
             acc.expand_bounds(wmin, wmax);
             acc.meshlets.push(ChunkMeshletItem {
                 asset_path: format!("{prefix}{}", inst.mesh),
                 material: mat_handle,
                 transform: tf,
-                cast_shadows: config.shadows_enabled && inst.cast_shadows,
+                cast_shadows,
             });
         }
 
@@ -442,8 +453,10 @@ fn setup_meshlet_scene(
                 .materials
                 .get(inst.material_id as usize)
                 .is_some_and(|m| m.alpha_mode != "Opaque");
+            let static_casts_realtime_shadow = !config.vlm_active || config.static_realtime_shadows;
             let cast_shadows = config.shadows_enabled
                 && inst.cast_shadows
+                && static_casts_realtime_shadow
                 && (config.foliage_shadows || (!is_transparent && !mat_is_non_opaque));
             let acc = chunk_map.entry(inst.chunk.clone()).or_default();
             acc.expand_bounds(wmin, wmax);
@@ -548,17 +561,28 @@ fn setup_meshlet_scene(
 
                         let (shadow_depth_bias, shadow_normal_bias, est_texel) =
                             resolve_shadow_biases(&config);
-                        let num_cascades = config.shadow_cascades.clamp(1, 4);
-                        let max_dist = config.shadow_distance.max(6.0);
+                        // 当 VLM 静态软阴影掩码激活且静态物体免投实时阴影时，实时 CSM 仅服务动态角色，自动收缩为 1 级联近景高精阴影
+                        let char_only_csm = config.vlm_active && !config.static_realtime_shadows;
+                        let num_cascades = if char_only_csm {
+                            1
+                        } else {
+                            config.shadow_cascades.clamp(1, 4)
+                        };
+                        let max_dist = if char_only_csm {
+                            config.first_cascade_distance.max(14.0).min(config.shadow_distance.max(14.0))
+                        } else {
+                            config.shadow_distance.max(6.0)
+                        };
                         let first_bound = config.first_cascade_distance.clamp(3.0, max_dist * 0.8);
                         if enable_shadow {
                             info!(
-                                "  [阴影配置] {}px × {} casc (近距 {:.1}m / 最远 {:.1}m, 首级纹素约 {:.3}m): depth_bias={:.3}, normal_bias={:.3}",
+                                "  [阴影配置] {}px × {} casc (近距 {:.1}m / 最远 {:.1}m, 首级纹素约 {:.3}m{}): depth_bias={:.3}, normal_bias={:.3}",
                                 config.shadow_map_size,
                                 num_cascades,
                                 first_bound,
                                 max_dist,
                                 est_texel,
+                                if char_only_csm { ", VLM 静态阴影减负: 仅动态角色投射实时阴影" } else { "" },
                                 shadow_depth_bias,
                                 shadow_normal_bias
                             );
@@ -639,6 +663,7 @@ fn setup_meshlet_scene(
                                 inner_angle,
                                 outer_angle,
                                 shadow_maps_enabled: false,
+                                affects_lightmapped_mesh_diffuse: !config.vlm_active,
                                 ..default()
                             },
                             ManagedLocalLight {
@@ -679,6 +704,7 @@ fn setup_meshlet_scene(
                                 intensity: init_intensity,
                                 range,
                                 shadow_maps_enabled: false,
+                                affects_lightmapped_mesh_diffuse: !config.vlm_active,
                                 ..default()
                             },
                             ManagedLocalLight {

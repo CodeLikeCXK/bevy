@@ -478,6 +478,24 @@ fn second_cull(
             },
             0,
         );
+        ctx.command_encoder().clear_buffer(
+            if ping {
+                &meshlet_view_resources.second_bvh_cull_count_front
+            } else {
+                &meshlet_view_resources.second_bvh_cull_count_back
+            },
+            0,
+            Some(4),
+        );
+        ctx.command_encoder().clear_buffer(
+            if ping {
+                &meshlet_view_resources.second_bvh_cull_dispatch_front
+            } else {
+                &meshlet_view_resources.second_bvh_cull_dispatch_back
+            },
+            0,
+            Some(4),
+        );
         ping = !ping;
     }
     ctx.command_encoder().pop_debug_group();

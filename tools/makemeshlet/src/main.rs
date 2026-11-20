@@ -1,11 +1,14 @@
 mod ao_baker;
 mod lod_mesh;
 mod scene;
+mod vlm_baker;
+mod vlm_gpu;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ao_baker::{bake_vertex_ao, AoBakeConfig, AoBvh};
+use vlm_baker::VlmBakeConfig;
 
 use bevy_asset::saver::{AssetSaver, SavedAsset};
 use bevy_asset::{AssetPath, RenderAssetUsages};
@@ -24,11 +27,7 @@ use scene::{MemoryWriter, SceneExportOptions};
 )]
 struct Args {
     /// 输入的 .gltf 或 .glb 文件路径
-    #[arg(
-        short,
-        long,
-        default_value = r"C:\Users\12410\Downloads\TestMesh\military_trenches_tunnel_metal_corrugated_01_yd0hehq_gltf_high\Military_Trenches_Tunnel_Metal_Corrugated_01_yd0hehq_High.gltf"
-    )]
+    #[arg(short, long)]
     input: PathBuf,
 
     /// 输出文件路径或目标目录（默认输出到与输入文件相同目录）
@@ -94,6 +93,50 @@ struct Args {
     /// 允许显式标记为 MESH3D_LOD 的物体保留 glTF AlphaMode::Blend（默认自动转为 AlphaMode::Mask 以避免透明过绘瓶颈）
     #[arg(long, default_value_t = false)]
     lod_keep_blend: bool,
+
+    /// 禁用离线静态表面虚拟光照贴图（Virtual Lightmap SpatialHash Tile）烘焙（场景模式下默认开启）
+    #[arg(long, default_value_t = false)]
+    no_vlm: bool,
+
+    /// 仅离线烘焙静态表面虚拟光照贴图 (.vlm.bin)，跳过贴图导出、逐顶点 AO 与 Meshlet/LOD 网格构建（自动启用 --scene）
+    #[arg(long, default_value_t = false)]
+    vlm_only: bool,
+
+    /// VLM Level 0 单纹素物理尺寸（米，默认 0.06m = 6cm；单 8x8 砖块覆盖 48cm x 48cm）
+    #[arg(long, default_value_t = 0.06)]
+    vlm_texel_size: f32,
+
+    /// VLM 空间层级数量（1..=3，默认 2：Level 0 精细 + Level 1 远景平滑回退）
+    #[arg(long, default_value_t = 2)]
+    vlm_levels: u32,
+
+    /// VLM 每有效纹素的半球路径追踪采样数（默认 32，配合 3x3 切平面双边降噪）
+    #[arg(long, default_value_t = 32)]
+    vlm_samples: u32,
+
+    /// VLM 间接漫反射反弹迭代次数（基于哈希缓存自举，默认 2）
+    #[arg(long, default_value_t = 2)]
+    vlm_bounces: u32,
+
+    /// VLM 主平行光软阴影视锥角半径（度，默认 0.8°）
+    #[arg(long, default_value_t = 0.8)]
+    vlm_sun_angle_deg: f32,
+
+    /// VLM 间接光反弹强度倍率（默认 1.0）
+    #[arg(long, default_value_t = 1.0)]
+    vlm_gi_scale: f32,
+
+    /// VLM 点/聚光灯遮挡测试终点灯具避让半径（米，默认 0.35；跳过灯笼/灯罩自身几何体，消除圆点走样）
+    #[arg(long, default_value_t = 0.35)]
+    vlm_light_clearance: f32,
+
+    /// VLM 点/聚光灯球面软阴影采样半径（米，默认 0.15）
+    #[arg(long, default_value_t = 0.15)]
+    vlm_light_radius: f32,
+
+    /// 强制使用多线程 CPU 烘焙 VLM（默认优先启用 headless wgpu GPU 加速，不可用时自动回退 CPU）
+    #[arg(long, default_value_t = false)]
+    vlm_cpu: bool,
 }
 
 use bevy_tasks::{AsyncComputeTaskPool, TaskPool};
@@ -104,12 +147,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化多线程任务池（供 METIS 与 Meshlet 简化算法并行加速）
     AsyncComputeTaskPool::get_or_init(TaskPool::default);
 
+    let scene_mode = args.scene || args.vlm_only;
+
     let ao_config = AoBakeConfig {
-        enabled: !args.no_ao,
+        enabled: !args.no_ao && !args.vlm_only,
         samples: args.ao_samples,
         radius: args.ao_radius,
         power: args.ao_power,
         bias: args.ao_bias,
+    };
+
+    let vlm_config = VlmBakeConfig {
+        enabled: (!args.no_vlm) || args.vlm_only,
+        texel_size: args.vlm_texel_size,
+        levels: args.vlm_levels,
+        samples: args.vlm_samples,
+        bounces: args.vlm_bounces,
+        sun_angle_deg: args.vlm_sun_angle_deg,
+        gi_scale: args.vlm_gi_scale,
+        local_light_clearance: args.vlm_light_clearance,
+        local_light_radius: args.vlm_light_radius,
+        use_gpu: !args.vlm_cpu,
+        ..Default::default()
     };
 
     println!("=======================================================");
@@ -117,6 +176,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=======================================================");
     println!("输入文件: {}", args.input.display());
     println!("量化因子: {} (精度: 1/2^{} cm)", args.quantization, args.quantization);
+    if args.vlm_only {
+        println!("模式: 仅烘焙 Virtual Lightmap (--vlm-only，跳过 Meshlet/LOD/AO/贴图导出)");
+    }
     if ao_config.is_active() {
         println!(
             "静态顶点 AO: ON (samples={}, radius={:.2}m, power={:.2}, bias={:.4}m)",
@@ -127,6 +189,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         println!("静态顶点 AO: OFF");
+    }
+    if scene_mode {
+        if vlm_config.enabled {
+            println!(
+                "静态 Virtual Lightmap: ON (backend={}, texel={:.3}m, levels={}, samples={}, bounces={}, sun_angle={:.2}°)",
+                if vlm_config.use_gpu {
+                    "GPU 优先 (自动回退 CPU)"
+                } else {
+                    "CPU (--vlm-cpu)"
+                },
+                vlm_config.texel_size,
+                vlm_config.levels,
+                vlm_config.samples,
+                vlm_config.bounces,
+                vlm_config.sun_angle_deg
+            );
+        } else {
+            println!("静态 Virtual Lightmap: OFF (--no-vlm)");
+        }
     }
 
     if !args.input.exists() {
@@ -146,7 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.to_str())
         .unwrap_or("output");
 
-    if args.scene {
+    if scene_mode {
         let out_dir = args.output.clone().unwrap_or_else(|| input_dir.to_path_buf());
         let options = SceneExportOptions {
             input: &args.input,
@@ -161,7 +242,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_batch_tris: args.max_batch_tris,
             auto_instance_min: args.auto_instance_min,
             ao: ao_config,
+            vlm: vlm_config,
             lod_keep_blend: args.lod_keep_blend,
+            vlm_only: args.vlm_only,
         };
         return scene::run_scene_export(&document, &buffers, &images, &options);
     }

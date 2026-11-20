@@ -49,6 +49,9 @@ use crate::{
 pub mod environment_map;
 pub mod generate;
 pub mod irradiance_volume;
+pub mod virtual_lightmap;
+
+pub use virtual_lightmap::{GpuVirtualLightmap, VirtualLightmap, VirtualLightmapPlugin};
 
 /// The maximum number of each type of light probe that each view will consider.
 ///
@@ -517,9 +520,11 @@ impl Plugin for LightProbePlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "environment_map.wesl");
         load_shader_library!(app, "irradiance_volume.wesl");
+        load_shader_library!(app, "virtual_lightmap.wesl");
 
         app.add_plugins((
             EnvironmentMapGenerationPlugin,
+            VirtualLightmapPlugin,
             ExtractInstancesPlugin::<EnvironmentMapIds, RenderApp>::new(),
         ));
 

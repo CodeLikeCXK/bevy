@@ -135,3 +135,10 @@ const VISIBILITY_RANGE_UNIFORM_BUFFER_SIZE: u32 = 64u;
 @group(1) @binding(6) var clustered_decal_textures: binding_array<texture_2d<f32>, 8u>;
 @group(1) @binding(7) var clustered_decal_sampler: sampler;
 }
+
+@if(VIRTUAL_LIGHTMAP) {
+@group(1) @binding(8) var<storage, read> vlm_params: types::VirtualLightmapParams;
+@group(1) @binding(9) var<storage, read> vlm_tile_buffer: array<vec2<u32>>;
+@group(1) @binding(10) var vlm_atlas_texture: texture_2d<f32>;
+@group(1) @binding(11) var vlm_atlas_sampler: sampler;
+}

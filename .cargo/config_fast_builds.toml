@@ -167,3 +167,6 @@ rustflags = [
 # Nightly
 # [unstable]
 # no-embed-metadata = true
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+neon,+fp16,+dotprod"]

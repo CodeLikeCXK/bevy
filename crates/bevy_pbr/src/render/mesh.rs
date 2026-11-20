@@ -369,6 +369,9 @@ pub enum AoDebugView {
     IblSpecularOnly,
     MeshletClusters,
     MeshletTriangleDensity,
+    VlmIrradiance,
+    VlmSunShadowMask,
+    VlmTiles,
 }
 
 impl AoDebugView {
@@ -380,7 +383,10 @@ impl AoDebugView {
             Self::SpecularOcclusion => Self::IblSpecularOnly,
             Self::IblSpecularOnly => Self::MeshletClusters,
             Self::MeshletClusters => Self::MeshletTriangleDensity,
-            Self::MeshletTriangleDensity => Self::Lit,
+            Self::MeshletTriangleDensity => Self::VlmIrradiance,
+            Self::VlmIrradiance => Self::VlmSunShadowMask,
+            Self::VlmSunShadowMask => Self::VlmTiles,
+            Self::VlmTiles => Self::Lit,
         }
     }
 
@@ -393,6 +399,9 @@ impl AoDebugView {
             Self::IblSpecularOnly => "IBL Specular Only",
             Self::MeshletClusters => "Meshlet Clusters",
             Self::MeshletTriangleDensity => "Meshlet Tri Density",
+            Self::VlmIrradiance => "VLM Baked GI",
+            Self::VlmSunShadowMask => "VLM Sun Shadow Mask",
+            Self::VlmTiles => "VLM Spatial Tiles",
         }
     }
 }
@@ -405,6 +414,7 @@ pub struct ViewKeyCache(HashMap<RetainedViewEntity, MeshPipelineKey>);
 pub fn check_views_need_specialization(
     mut view_key_cache: ResMut<ViewKeyCache>,
     mut dirty_specializations: ResMut<DirtySpecializations>,
+    gpu_vlm: Option<Res<GpuVirtualLightmap>>,
     mut views: Query<(
         &ExtractedView,
         Option<&ExtractedCamera>,
@@ -436,6 +446,7 @@ pub fn check_views_need_specialization(
     )>,
     mut seen_views: Local<HashSet<RetainedViewEntity>>,
 ) {
+    let has_virtual_lightmap = gpu_vlm.as_deref().is_some_and(GpuVirtualLightmap::is_ready);
     seen_views.clear();
 
     for (
@@ -486,6 +497,10 @@ pub fn check_views_need_specialization(
 
         if has_irradiance_volumes {
             view_key |= MeshPipelineKey::IRRADIANCE_VOLUME;
+        }
+
+        if has_virtual_lightmap {
+            view_key |= MeshPipelineKey::VIRTUAL_LIGHTMAP;
         }
 
         if has_ssr {
@@ -3177,7 +3192,8 @@ bitflags::bitflags! {
         const INVERT_CULLING                    = 1 << 22;
         const PREPASS_READS_MATERIAL            = 1 << 23;
         const CONTACT_SHADOWS                   = 1 << 24;
-        const LAST_FLAG                         = Self::CONTACT_SHADOWS.bits();
+        const VIRTUAL_LIGHTMAP                  = 1 << 25;
+        const LAST_FLAG                         = Self::VIRTUAL_LIGHTMAP.bits();
 
         const ALL_PREPASS_BITS                  = Self::DEPTH_PREPASS.bits()
                                                 | Self::NORMAL_PREPASS.bits()
@@ -3228,6 +3244,9 @@ bitflags::bitflags! {
         const AO_DEBUG_IBL_SPECULAR_ONLY = 4 << Self::AO_DEBUG_SHIFT_BITS;
         const AO_DEBUG_MESHLET_CLUSTERS = 5 << Self::AO_DEBUG_SHIFT_BITS;
         const AO_DEBUG_MESHLET_TRIANGLE_DENSITY = 6 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_VLM_IRRADIANCE = 7 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_VLM_SUN_SHADOW = 8 << Self::AO_DEBUG_SHIFT_BITS;
+        const AO_DEBUG_VLM_TILES = 9 << Self::AO_DEBUG_SHIFT_BITS;
         const ALL_RESERVED_BITS =
             Self::BLEND_RESERVED_BITS.bits() |
             Self::MSAA_RESERVED_BITS.bits() |
@@ -3269,7 +3288,7 @@ impl MeshPipelineKey {
         .count_ones() as u64
         + Self::SCREEN_SPACE_SPECULAR_TRANSMISSION_SHIFT_BITS;
 
-    const AO_DEBUG_MASK_BITS: u64 = 0b111;
+    const AO_DEBUG_MASK_BITS: u64 = 0b1111;
     const AO_DEBUG_SHIFT_BITS: u64 =
         Self::COLOR_TARGET_FORMAT_MASK_BITS.count_ones() as u64 + Self::COLOR_TARGET_FORMAT_SHIFT_BITS;
 
@@ -3282,6 +3301,9 @@ impl MeshPipelineKey {
             AoDebugView::IblSpecularOnly => Self::AO_DEBUG_IBL_SPECULAR_ONLY,
             AoDebugView::MeshletClusters => Self::AO_DEBUG_MESHLET_CLUSTERS,
             AoDebugView::MeshletTriangleDensity => Self::AO_DEBUG_MESHLET_TRIANGLE_DENSITY,
+            AoDebugView::VlmIrradiance => Self::AO_DEBUG_VLM_IRRADIANCE,
+            AoDebugView::VlmSunShadowMask => Self::AO_DEBUG_VLM_SUN_SHADOW,
+            AoDebugView::VlmTiles => Self::AO_DEBUG_VLM_TILES,
         }
     }
 
@@ -3299,6 +3321,12 @@ impl MeshPipelineKey {
             Some("AO_DEBUG_MESHLET_CLUSTERS")
         } else if mode == Self::AO_DEBUG_MESHLET_TRIANGLE_DENSITY {
             Some("AO_DEBUG_MESHLET_TRIANGLE_DENSITY")
+        } else if mode == Self::AO_DEBUG_VLM_IRRADIANCE {
+            Some("AO_DEBUG_VLM_IRRADIANCE")
+        } else if mode == Self::AO_DEBUG_VLM_SUN_SHADOW {
+            Some("AO_DEBUG_VLM_SUN_SHADOW")
+        } else if mode == Self::AO_DEBUG_VLM_TILES {
+            Some("AO_DEBUG_VLM_TILES")
         } else {
             None
         }
@@ -3769,6 +3797,10 @@ impl SpecializedMeshPipeline for MeshPipeline {
 
         if key.contains(MeshPipelineKey::IRRADIANCE_VOLUME) && IRRADIANCE_VOLUMES_ARE_USABLE {
             shader_defs.push("IRRADIANCE_VOLUME".into());
+        }
+
+        if key.contains(MeshPipelineKey::VIRTUAL_LIGHTMAP) {
+            shader_defs.push("VIRTUAL_LIGHTMAP".into());
         }
 
         if key.contains(MeshPipelineKey::LIGHTMAPPED) {
