@@ -205,7 +205,7 @@ out/
 
 ## 6. Virtual Lightmap Conceptual Inspiration & Attribution
 
-### Conceptual Inspiration (*Inspired by*)
+### Conceptual Inspiration
 
 The **Surface Tangent-Plane SpatialHash Virtual Lightmap (VLM)** module in this tool and the companion Bevy rendering pipeline is **conceptually inspired by**:
 

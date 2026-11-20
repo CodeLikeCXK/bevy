@@ -205,9 +205,9 @@ out/
 
 ## 6. Virtual Lightmap 技术思路来源与授权状态说明
 
-### 思路来源与致谢（Inspired by）
+### 思路来源与致谢
 
-本工具及配套 Bevy 渲染管线中的 **Surface Tangent-Plane SpatialHash Virtual Lightmap（VLM）** 模块，在高层架构思路上受到以下开源研究项目的启发（*Conceptually inspired by*）：
+本工具及配套 Bevy 渲染管线中的 **Surface Tangent-Plane SpatialHash Virtual Lightmap（VLM）** 模块，在高层架构思路上受到以下研究项目的启发：
 
 - **参考项目**：[johanholwerda/virtualLightmaps — Irradiance cache with hashed lightmap tiles](https://github.com/johanholwerda/virtualLightmaps)（作者：Johan Holwerda）
 - **受到启发的核心思路**：摆脱传统手工/自动展开的第二套光照 UV（UV2），直接以世界空间坐标与法向构建开放寻址空间哈希表来索引紧凑的 `8×8` 光照贴图砖块（Hashed Lightmap Tiles），并在多跳间接光照计算阶段复用该空间哈希结构本身作为 Radiance Cache 进行自举迭代。
