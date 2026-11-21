@@ -10,12 +10,15 @@ use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 
 use bevy::{
+    asset::RenderAssetUsages,
     image::{
         ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler,
         ImageSamplerDescriptor,
     },
     light::CascadeShadowConfigBuilder,
+    math::Affine2,
     prelude::*,
+    render::render_resource::{TextureDimension, TextureFormat},
 };
 use serde::Deserialize;
 
@@ -83,6 +86,21 @@ fn default_true() -> bool {
     true
 }
 
+fn default_ior() -> f32 {
+    1.5
+}
+
+fn default_reflectance() -> f32 {
+    0.5
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct SceneUvTransform {
+    pub offset: [f32; 2],
+    pub scale: [f32; 2],
+    pub rotation: f32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SceneMaterial {
     pub id: u32,
@@ -103,6 +121,16 @@ pub struct SceneMaterial {
     pub double_sided: bool,
     #[serde(default = "default_wrap_pair")]
     pub wrap_mode: [String; 2],
+    #[serde(default)]
+    pub unlit: bool,
+    #[serde(default = "default_ior")]
+    pub ior: f32,
+    #[serde(default = "default_reflectance")]
+    pub reflectance: f32,
+    #[serde(default)]
+    pub flip_normal_map_y: bool,
+    #[serde(default)]
+    pub uv_transform: Option<SceneUvTransform>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,12 +247,31 @@ struct ManagedLocalLight {
     active: bool,
 }
 
+/// 场景贴图运行时 Mipmap 生成语义：不同语义采用不同滤波规则（sRGB 线性滤波 / Normal 重归一化 / Linear 直接平均）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextureMipRole {
+    SrgbColor,
+    NormalMap,
+    LinearData,
+}
+
+#[derive(Resource, Default)]
+struct PendingSceneMipmaps {
+    /// 待补全 Mipmap 链的场景贴图（按 AssetId 去重，ORM 共用句柄只生成一次）
+    pending: HashMap<AssetId<Image>, TextureMipRole>,
+    generated_count: usize,
+}
+
 pub struct MeshletScenePlugin;
 
 impl Plugin for MeshletScenePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_meshlet_scene)
-            .add_systems(Update, update_active_local_lights);
+        app.init_resource::<PendingSceneMipmaps>()
+            .add_systems(Startup, setup_meshlet_scene)
+            .add_systems(
+                Update,
+                (generate_scene_texture_mipmaps, update_active_local_lights),
+            );
     }
 }
 
@@ -255,28 +302,34 @@ fn parse_wrap_mode(mode: &str) -> ImageAddressMode {
     }
 }
 
-/// 加载场景贴图：同时配置色彩空间（sRGB vs Linear）与显式采样寻址模式（解决平铺 UV 被 ClampToEdge 拉丝成条纹的问题）
+/// 加载场景贴图：配置色彩空间（sRGB vs Linear）、三线性+各向异性采样器，并登记至运行时 Mipmap 生成队列
 fn load_scene_texture(
     asset_server: &AssetServer,
+    pending_mips: &mut PendingSceneMipmaps,
     asset_uri: &str,
-    is_srgb: bool,
+    role: TextureMipRole,
     wrap_mode: &[String; 2],
 ) -> Handle<Image> {
+    let is_srgb = matches!(role, TextureMipRole::SrgbColor);
     let wrap_u = parse_wrap_mode(&wrap_mode[0]);
     let wrap_v = parse_wrap_mode(&wrap_mode[1]);
-    asset_server
+    let handle: Handle<Image> = asset_server
         .load_builder()
         .with_settings(move |s: &mut ImageLoaderSettings| {
             s.is_srgb = is_srgb;
+            s.asset_usage = RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD;
             let mut desc = ImageSamplerDescriptor::linear();
             desc.address_mode_u = wrap_u;
             desc.address_mode_v = wrap_v;
             desc.address_mode_w = wrap_u;
             desc.set_filter(ImageFilterMode::Linear);
+            desc.mipmap_filter = ImageFilterMode::Linear;
             desc.anisotropy_clamp = 4;
             s.sampler = ImageSampler::Descriptor(desc);
         })
-        .load(asset_uri.to_string())
+        .load(asset_uri.to_string());
+    pending_mips.pending.entry(handle.id()).or_insert(role);
+    handle
 }
 
 /// 将局部空间 AABB 的 8 个角点变换到世界空间，求紧致世界 AABB
@@ -321,6 +374,7 @@ fn setup_meshlet_scene(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut standard_materials: ResMut<Assets<StandardMaterial>>,
+    mut pending_mips: ResMut<PendingSceneMipmaps>,
     config: Res<MeshletSceneConfig>,
 ) {
     let prefix = format!("{}://", config.asset_source);
@@ -344,23 +398,53 @@ fn setup_meshlet_scene(
             }
         };
 
-        // 1. 构建去重 PBR 材质表（支持 Opaque / Mask / Blend 与显式采样寻址模式）
+        // 1. 构建去重 PBR 材质表（支持 Opaque / Mask / Blend、Albedo+Normal+ORM 三贴图与 UV 变换）
         let mut material_handles = Vec::with_capacity(manifest.materials.len());
         for mat in &manifest.materials {
             let base_color_texture = mat.base_color_texture.as_ref().map(|p| {
-                load_scene_texture(&asset_server, &format!("{prefix}{p}"), true, &mat.wrap_mode)
+                load_scene_texture(
+                    &asset_server,
+                    &mut pending_mips,
+                    &format!("{prefix}{p}"),
+                    TextureMipRole::SrgbColor,
+                    &mat.wrap_mode,
+                )
             });
             let normal_map_texture = mat.normal_texture.as_ref().map(|p| {
-                load_scene_texture(&asset_server, &format!("{prefix}{p}"), false, &mat.wrap_mode)
+                load_scene_texture(
+                    &asset_server,
+                    &mut pending_mips,
+                    &format!("{prefix}{p}"),
+                    TextureMipRole::NormalMap,
+                    &mat.wrap_mode,
+                )
             });
             let metallic_roughness_texture = mat.metallic_roughness_texture.as_ref().map(|p| {
-                load_scene_texture(&asset_server, &format!("{prefix}{p}"), false, &mat.wrap_mode)
+                load_scene_texture(
+                    &asset_server,
+                    &mut pending_mips,
+                    &format!("{prefix}{p}"),
+                    TextureMipRole::LinearData,
+                    &mat.wrap_mode,
+                )
             });
             let occlusion_texture = mat.occlusion_texture.as_ref().map(|p| {
-                load_scene_texture(&asset_server, &format!("{prefix}{p}"), false, &mat.wrap_mode)
+                load_scene_texture(
+                    &asset_server,
+                    &mut pending_mips,
+                    &format!("{prefix}{p}"),
+                    TextureMipRole::LinearData,
+                    &mat.wrap_mode,
+                )
             });
             let emissive_texture = mat.emissive_texture.as_ref().map(|p| {
-                load_scene_texture(&asset_server, &format!("{prefix}{p}"), true, &mat.wrap_mode)
+                load_scene_texture(
+                    &asset_server,
+                    &mut pending_mips,
+                    &format!("{prefix}{p}"),
+                    TextureMipRole::SrgbColor,
+                    &mat.wrap_mode,
+                )
             });
 
             let alpha_mode = match mat.alpha_mode.as_str() {
@@ -368,6 +452,13 @@ fn setup_meshlet_scene(
                 "Blend" => AlphaMode::Blend,
                 _ => AlphaMode::Opaque,
             };
+            let uv_transform = mat.uv_transform.map_or(Affine2::IDENTITY, |t| {
+                Affine2::from_scale_angle_translation(
+                    t.scale.into(),
+                    -t.rotation,
+                    t.offset.into(),
+                )
+            });
 
             let handle = standard_materials.add(StandardMaterial {
                 base_color: Color::linear_rgba(
@@ -391,6 +482,11 @@ fn setup_meshlet_scene(
                 } else {
                     Some(bevy::render::render_resource::Face::Back)
                 },
+                unlit: mat.unlit,
+                ior: mat.ior,
+                reflectance: mat.reflectance,
+                flip_normal_map_y: mat.flip_normal_map_y,
+                uv_transform,
                 ..default()
             });
             material_handles.push(handle);
@@ -938,5 +1034,310 @@ fn spawn_default_light(commands: &mut Commands, shadows_enabled: bool, config: &
             }
             .build(),
         );
+    }
+}
+
+/// 为刚加载完成的场景 PBR PNG 贴图按帧批量补全完整 Mipmap 链（让 Meshlet 的 `textureSampleGrad` 与各向异性过滤真正生效），
+/// 并在生成完毕后将 `asset_usage` 切为 `RENDER_WORLD` 以自动释放 CPU 副本内存。
+fn generate_scene_texture_mipmaps(
+    mut pending: ResMut<PendingSceneMipmaps>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if pending.pending.is_empty() {
+        return;
+    }
+
+    const MAX_PER_FRAME: usize = 8;
+    let ready: Vec<(AssetId<Image>, TextureMipRole)> = pending
+        .pending
+        .iter()
+        .filter(|(id, _)| images.contains(**id))
+        .take(MAX_PER_FRAME)
+        .map(|(id, role)| (*id, *role))
+        .collect();
+
+    if ready.is_empty() {
+        return;
+    }
+
+    for (id, role) in ready {
+        pending.pending.remove(&id);
+        let Some(mut image) = images.get_mut(id) else {
+            continue;
+        };
+        if build_rgba8_mip_chain(&mut image, role) {
+            pending.generated_count += 1;
+        }
+    }
+
+    if pending.pending.is_empty() && pending.generated_count > 0 {
+        info!(
+            "场景 PBR 贴图运行时 Mipmap 链生成完成: 共 {} 张（sRGB/Normal 重归一化/ORM 线性滤波）",
+            pending.generated_count
+        );
+    }
+}
+
+#[inline]
+fn srgb_u8_to_linear(v: u8) -> f32 {
+    let c = v as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn linear_to_srgb_u8(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let s = if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (s.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// 为单层 2D `Rgba8Unorm`/`Rgba8UnormSrgb` 图像补全完整 Mipmap 金字塔（向下至 1×1）。
+fn build_rgba8_mip_chain(image: &mut Image, role: TextureMipRole) -> bool {
+    let desc = &image.texture_descriptor;
+    if desc.dimension != TextureDimension::D2
+        || desc.mip_level_count > 1
+        || desc.size.depth_or_array_layers != 1
+        || !matches!(
+            desc.format,
+            TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb
+        )
+    {
+        return false;
+    }
+
+    let mut cur_w = desc.size.width;
+    let mut cur_h = desc.size.height;
+    if cur_w <= 1 && cur_h <= 1 {
+        return false;
+    }
+
+    let expected_len = (cur_w as usize) * (cur_h as usize) * 4;
+    let Some(ref mut data) = image.data else {
+        return false;
+    };
+    if data.len() != expected_len {
+        return false;
+    }
+
+    let mip_levels = (cur_w.max(cur_h)).ilog2() + 1;
+    let mut total_bytes = expected_len;
+    let (mut tw, mut th) = (cur_w, cur_h);
+    for _ in 1..mip_levels {
+        tw = (tw / 2).max(1);
+        th = (th / 2).max(1);
+        total_bytes += (tw as usize) * (th as usize) * 4;
+    }
+    data.reserve(total_bytes - expected_len);
+
+    let mut prev_offset = 0usize;
+    for _ in 1..mip_levels {
+        let next_w = (cur_w / 2).max(1);
+        let next_h = (cur_h / 2).max(1);
+        let prev_len = (cur_w as usize) * (cur_h as usize) * 4;
+        let next_offset = data.len();
+        data.resize(next_offset + (next_w as usize) * (next_h as usize) * 4, 0);
+
+        let (head, dst) = data.split_at_mut(next_offset);
+        let src = &head[prev_offset..prev_offset + prev_len];
+
+        for ny in 0..next_h {
+            let sy0 = (ny * 2).min(cur_h - 1);
+            let sy1 = (sy0 + 1).min(cur_h - 1);
+            // 奇数高度时在最后一行吸收第 3 行防止边缘偏移
+            let sy2 = if cur_h > 1 && (cur_h & 1) == 1 && ny == next_h - 1 {
+                Some(cur_h - 1)
+            } else {
+                None
+            };
+            for nx in 0..next_w {
+                let sx0 = (nx * 2).min(cur_w - 1);
+                let sx1 = (sx0 + 1).min(cur_w - 1);
+                let sx2 = if cur_w > 1 && (cur_w & 1) == 1 && nx == next_w - 1 {
+                    Some(cur_w - 1)
+                } else {
+                    None
+                };
+
+                let mut xs = [sx0, sx1, sx0];
+                let x_count = if let Some(x2) = sx2 {
+                    xs[2] = x2;
+                    3usize
+                } else if cur_w > 1 {
+                    2usize
+                } else {
+                    1usize
+                };
+                let mut ys = [sy0, sy1, sy0];
+                let y_count = if let Some(y2) = sy2 {
+                    ys[2] = y2;
+                    3usize
+                } else if cur_h > 1 {
+                    2usize
+                } else {
+                    1usize
+                };
+
+                let out_idx = ((ny as usize) * (next_w as usize) + (nx as usize)) * 4;
+                let inv_n = 1.0 / (x_count * y_count) as f32;
+
+                match role {
+                    TextureMipRole::SrgbColor => {
+                        let (mut r, mut g, mut b, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                        for &sy in &ys[..y_count] {
+                            let row = (sy as usize) * (cur_w as usize);
+                            for &sx in &xs[..x_count] {
+                                let i = (row + sx as usize) * 4;
+                                r += srgb_u8_to_linear(src[i]);
+                                g += srgb_u8_to_linear(src[i + 1]);
+                                b += srgb_u8_to_linear(src[i + 2]);
+                                a += src[i + 3] as f32;
+                            }
+                        }
+                        dst[out_idx] = linear_to_srgb_u8(r * inv_n);
+                        dst[out_idx + 1] = linear_to_srgb_u8(g * inv_n);
+                        dst[out_idx + 2] = linear_to_srgb_u8(b * inv_n);
+                        dst[out_idx + 3] = (a * inv_n).round().clamp(0.0, 255.0) as u8;
+                    }
+                    TextureMipRole::NormalMap => {
+                        let (mut nx_sum, mut ny_sum, mut nz_sum) = (0.0f32, 0.0f32, 0.0f32);
+                        for &sy in &ys[..y_count] {
+                            let row = (sy as usize) * (cur_w as usize);
+                            for &sx in &xs[..x_count] {
+                                let i = (row + sx as usize) * 4;
+                                nx_sum += src[i] as f32 * (2.0 / 255.0) - 1.0;
+                                ny_sum += src[i + 1] as f32 * (2.0 / 255.0) - 1.0;
+                                nz_sum += src[i + 2] as f32 * (2.0 / 255.0) - 1.0;
+                            }
+                        }
+                        let len_sq = nx_sum * nx_sum + ny_sum * ny_sum + nz_sum * nz_sum;
+                        let (ux, uy, uz) = if len_sq > 1e-8 {
+                            let inv = len_sq.sqrt().recip();
+                            (nx_sum * inv, ny_sum * inv, nz_sum * inv)
+                        } else {
+                            (0.0, 0.0, 1.0)
+                        };
+                        dst[out_idx] = ((ux * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        dst[out_idx + 1] = ((uy * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        dst[out_idx + 2] = ((uz * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        dst[out_idx + 3] = 255;
+                    }
+                    TextureMipRole::LinearData => {
+                        let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
+                        for &sy in &ys[..y_count] {
+                            let row = (sy as usize) * (cur_w as usize);
+                            for &sx in &xs[..x_count] {
+                                let i = (row + sx as usize) * 4;
+                                r += src[i] as u32;
+                                g += src[i + 1] as u32;
+                                b += src[i + 2] as u32;
+                                a += src[i + 3] as u32;
+                            }
+                        }
+                        let cnt = (x_count * y_count) as u32;
+                        let half = cnt / 2;
+                        dst[out_idx] = ((r + half) / cnt) as u8;
+                        dst[out_idx + 1] = ((g + half) / cnt) as u8;
+                        dst[out_idx + 2] = ((b + half) / cnt) as u8;
+                        dst[out_idx + 3] = ((a + half) / cnt) as u8;
+                    }
+                }
+            }
+        }
+
+        prev_offset = next_offset;
+        cur_w = next_w;
+        cur_h = next_h;
+    }
+
+    image.texture_descriptor.mip_level_count = mip_levels;
+    image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::render::render_resource::Extent3d;
+
+    #[test]
+    fn test_runtime_mip_chain_srgb_normal_and_orm() {
+        // 1. 4x4 Normal map (2x2 alternating +X/-X tilted normals -> mip1/mip2 renormalize to (0, 0, 1))
+        let mut normal_bytes = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                let nx = if (x + y) % 2 == 0 { 204u8 } else { 51u8 }; // ~ +0.6 / -0.6
+                normal_bytes.extend_from_slice(&[nx, 128, 230, 255]);
+            }
+        }
+        let mut normal_img = Image::new(
+            Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            normal_bytes,
+            TextureFormat::Rgba8Unorm,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        assert!(build_rgba8_mip_chain(&mut normal_img, TextureMipRole::NormalMap));
+        assert_eq!(normal_img.texture_descriptor.mip_level_count, 3);
+        assert_eq!(normal_img.asset_usage, RenderAssetUsages::RENDER_WORLD);
+        let data = normal_img.data.as_ref().unwrap();
+        // Mip0: 16*4=64, Mip1: 4*4=16, Mip2: 1*4=4 => total 84 bytes
+        assert_eq!(data.len(), 84);
+        // Mip2 (last 4 bytes) should be renormalized to ~(128, 128, 255, 255)
+        let last = &data[80..84];
+        assert!((last[0] as i32 - 128).abs() <= 1);
+        assert!((last[1] as i32 - 128).abs() <= 1);
+        assert_eq!(last[2], 255);
+        assert_eq!(last[3], 255);
+
+        // 2. 2x2 sRGB checkerboard -> mip1 linear average ~188
+        let srgb_bytes = vec![
+            0, 0, 0, 255, 255, 255, 255, 255, //
+            255, 255, 255, 255, 0, 0, 0, 255,
+        ];
+        let mut srgb_img = Image::new(
+            Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            srgb_bytes,
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        assert!(build_rgba8_mip_chain(&mut srgb_img, TextureMipRole::SrgbColor));
+        assert_eq!(srgb_img.texture_descriptor.mip_level_count, 2);
+        let srgb_mip1 = &srgb_img.data.as_ref().unwrap()[16..20];
+        assert!((srgb_mip1[0] as i32 - 188).abs() <= 2);
+
+        // 3. 3x3 NPOT ORM linear data -> 3 mips (3x3, 1x1) => ilog2(3)+1 = 2 mips
+        let orm_bytes = vec![100, 200, 50, 255].repeat(9);
+        let mut orm_img = Image::new(
+            Extent3d {
+                width: 3,
+                height: 3,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            orm_bytes,
+            TextureFormat::Rgba8Unorm,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        assert!(build_rgba8_mip_chain(&mut orm_img, TextureMipRole::LinearData));
+        assert_eq!(orm_img.texture_descriptor.mip_level_count, 2);
+        let orm_mip1 = &orm_img.data.as_ref().unwrap()[36..40];
+        assert_eq!(orm_mip1, &[100, 200, 50, 255]);
     }
 }

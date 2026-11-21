@@ -121,8 +121,9 @@ cargo build --release --package makemeshlet
 | `--scene` | Flag | `false` | 启用场景级导出模式：递归遍历节点树变换、解析 Blender 角标、合批与分流、提取材质/灯光/HDRI、烘焙 AO 与 VLM 并生成 `<stem>.meshlet_scene.json`。 |
 | `--no-merge` | Flag | `false` | 场景模式下禁用按材质静态合并，保留各节点独立实例与世界位姿（仍会对共享同一 Mesh 图元的资产去重）。 |
 | `--dynamic-prefix <PREFIX>` | `Vec<String>` | 空 | 不参与静态合并的节点名称前缀，可重复多次指定（例如 `--dynamic-prefix Wheel_ --dynamic-prefix Door_`），命中节点将强制走动态独立实例化分支且不参与静态 VLM 遮挡。 |
-| `--export-textures` | Flag | `false` | 场景模式下将 glTF/GLB 内嵌或引用贴图导出为 PNG 至 `<output>/textures/` 子目录。 |
-| `--max-texture-size <U32>` | `u32` | `1024` | 导出贴图的最大边长（像素）；超过此尺寸自动按比例双线性降采样，`0` 表示不限制。针对核显/轻薄本推荐 `1024` 或 `512`。 |
+| `--export-textures` | Flag | `false` | 场景模式下按语义导出 PBR 贴图至 `<output>/textures/`：sRGB 色彩在线性空间降采样、Normal 贴图支持 2 通道 Z 重构与缩放重归一化、ORM 自动遵循 `R=O, G=R, B=M` 打包。 |
+| `--max-texture-size <U32>` | `u32` | `1024` | 导出贴图的最大边长（像素）；超过此尺寸自动按比例面积加权降采样，`0` 表示不限制。针对核显/轻薄本推荐 `1024` 或 `512`。 |
+| `--no-pack-orm` | Flag | `false` | 禁用将分离的 `occlusion` 与 `metallicRoughness` 贴图自动合并打包为单张标准 ORM PNG（默认自动合并以实现完整的 Albedo + Normal + ORM 三贴图工作流）。 |
 | `--grid-size <F32>` | `f32` | `12.0` | 静态合批的空间自动分块网格边长（米），用于把默认 `chunk="main"` 的大场景自动切分为空间区块以支持按距离流送卸载；`0` 表示禁用自动空间切分。 |
 | `--max-batch-tris <USIZE>` | `usize` | `250000` | 单个静态 Meshlet 合并批次的最大三角形数上限，超出后自动开启新批次；`0` 表示不限制。 |
 | `--auto-instance-min <USIZE>` | `usize` | `3` | 同一图元在场景非镜像可渲染节点中出现次数 $\ge N$ 时，自动走局部实例化复用而非复制进静态合并大网格；`0` 表示禁用自动实例化。 |

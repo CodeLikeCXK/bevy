@@ -12,7 +12,7 @@ bevy_pbr = { path = "../../crates/bevy_pbr", features = ["meshlet", "meshlet_pro
 bevy_asset = { path = "../../crates/bevy_asset" }
 bevy_math = { path = "../../crates/bevy_math" }
 bevy_tasks = { path = "../../crates/bevy_tasks" }
-gltf = { version = "1.4.0", default-features = false, features = ["names", "utils", "import", "KHR_lights_punctual", "extras"] }
+gltf = { version = "1.4.0", default-features = false, features = ["names", "utils", "import", "KHR_lights_punctual", "KHR_materials_emissive_strength", "KHR_materials_unlit", "KHR_materials_ior", "KHR_materials_specular", "KHR_texture_transform", "extras"] }
 clap = { version = "4.0", features = ["derive"] }
 futures-io = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }

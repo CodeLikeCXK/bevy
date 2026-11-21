@@ -35,15 +35,17 @@ fn fragment(
 @if(MESHLET_MESH_MATERIAL_PASS)
     let is_front = true;
 
+@if(MESHLET_MESH_MATERIAL_PASS && BINDLESS)
+    let slot = in.material_bind_group_slot;
 @if(!MESHLET_MESH_MATERIAL_PASS && BINDLESS)
     let slot = mesh[in.instance_index].material_and_lightmap_bind_group_slot & 0xffffu;
-@if(!MESHLET_MESH_MATERIAL_PASS && BINDLESS)
+@if(BINDLESS)
     let flags = pbr_bindings::material_array[material_indices[slot].material].flags;
-@if(!MESHLET_MESH_MATERIAL_PASS && BINDLESS)
+@if(BINDLESS)
     let uv_transform = pbr_bindings::material_array[material_indices[slot].material].uv_transform;
-@if(!MESHLET_MESH_MATERIAL_PASS && !BINDLESS)
+@if(!BINDLESS)
     let flags = pbr_bindings::material.flags;
-@if(!MESHLET_MESH_MATERIAL_PASS && !BINDLESS)
+@if(!BINDLESS)
     let uv_transform = pbr_bindings::material.uv_transform;
 
     // If we're in the crossfade section of a visibility range, conditionally
@@ -90,10 +92,11 @@ fn fragment(
         // Fill in the sample bias so we can sample from textures.
         var bias: SampleBias;
 @if(MESHLET_MESH_MATERIAL_PASS) {
-        // Apply mip bias by scaling the gradients used by textureSampleGrad.
+        // Apply mip bias and uv_transform linear Jacobian to gradients used by textureSampleGrad.
         let mip_scale = exp2(view.mip_bias);
-        bias.ddx_uv = in.ddx_uv * mip_scale;
-        bias.ddy_uv = in.ddy_uv * mip_scale;
+        let uv_transform_2x2 = mat2x2<f32>(uv_transform[0].xy, uv_transform[1].xy);
+        bias.ddx_uv = uv_transform_2x2 * (in.ddx_uv * mip_scale);
+        bias.ddy_uv = uv_transform_2x2 * (in.ddy_uv * mip_scale);
 }
 @if(!MESHLET_MESH_MATERIAL_PASS)
         bias.mip_bias = view.mip_bias;

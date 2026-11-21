@@ -27,6 +27,7 @@ use crate::ao_baker::{bake_vertex_ao, AoBakeConfig, AoBvh, AoOccluderCollector};
 use crate::lod_mesh::{
     build_mesh3d_lod_asset, parse_lod_distances, parse_lod_ratios, save_mesh3d_lod_asset,
 };
+use crate::texture_export::SemanticTextureExporter;
 use crate::vlm_baker::{
     bake_and_save_vlm, estimate_gltf_image_avg_linear_rgb, VlmBakeConfig, VlmMaterialInfo,
     VlmSceneCollector,
@@ -96,6 +97,34 @@ fn default_wrap_pair() -> [String; 2] {
     ["Repeat".to_string(), "Repeat".to_string()]
 }
 
+fn default_ior() -> f32 {
+    1.5
+}
+
+fn default_reflectance() -> f32 {
+    0.5
+}
+
+fn is_default_ior(v: &f32) -> bool {
+    (*v - 1.5).abs() < 1e-4
+}
+
+fn is_default_reflectance(v: &f32) -> bool {
+    (*v - 0.5).abs() < 1e-4
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// glTF `KHR_texture_transform` 导出的 2D UV 仿射变换参数
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SceneUvTransform {
+    pub offset: [f32; 2],
+    pub scale: [f32; 2],
+    pub rotation: f32,
+}
+
 /// PBR 材质描述（Meshlet 与 Mesh3d 实例共用此材质表）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneMaterial {
@@ -116,6 +145,16 @@ pub struct SceneMaterial {
     /// 贴图 UV 寻址模式 [wrap_u, wrap_v]（"Repeat" / "MirroredRepeat" / "ClampToEdge"）
     #[serde(default = "default_wrap_pair")]
     pub wrap_mode: [String; 2],
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unlit: bool,
+    #[serde(default = "default_ior", skip_serializing_if = "is_default_ior")]
+    pub ior: f32,
+    #[serde(default = "default_reflectance", skip_serializing_if = "is_default_reflectance")]
+    pub reflectance: f32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flip_normal_map_y: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv_transform: Option<SceneUvTransform>,
 }
 
 fn default_true() -> bool {
@@ -232,6 +271,10 @@ struct MaterialKey {
     emissive_tex: Option<usize>,
     double_sided: bool,
     wrap_mode_codes: [u8; 2],
+    unlit: bool,
+    ior_bits: u32,
+    reflectance_bits: u32,
+    uv_transform_bits: Option<[u32; 5]>,
 }
 
 /// 静态合并几何体缓冲（按 `(chunk, material_id)` 聚合）
@@ -266,6 +309,8 @@ pub struct SceneExportOptions<'a> {
     pub dynamic_prefixes: &'a [String],
     pub export_textures: bool,
     pub max_texture_size: u32,
+    /// 是否将分离的 Occlusion 与 MetallicRoughness 自动打包为单张标准 ORM 贴图
+    pub pack_orm: bool,
     /// 空间自动分块网格尺寸（米，0 表示不启用空间切分）
     pub grid_size: f32,
     /// 单个静态 Meshlet 批次最大三角形数（0 表示不限）
@@ -284,7 +329,7 @@ pub struct SceneExportOptions<'a> {
 
 struct SceneContext<'a> {
     buffers: &'a [gltf::buffer::Data],
-    exported_tex_paths: &'a [Option<String>],
+    tex_exporter: SemanticTextureExporter<'a>,
     image_avg_colors: &'a [[f32; 3]],
     options: &'a SceneExportOptions<'a>,
     prim_usage_counts: HashMap<(usize, usize), usize>,
@@ -328,39 +373,27 @@ pub fn run_scene_export(
         std::fs::create_dir_all(&meshes_dir)?;
     }
 
-    // 1. 导出贴图（若启用 --export-textures 且非 --vlm-only）
-    let mut exported_tex_paths = vec![None; images.len()];
-    if options.export_textures && !options.vlm_only && !images.is_empty() {
-        let textures_dir = options.out_dir.join("textures");
-        std::fs::create_dir_all(&textures_dir)?;
+    // 1. 准备语义感知贴图导出器（按材质引用延迟导出并去重：sRGB 线性缩放 / Normal 重归一化 / ORM 自动打包）
+    let export_textures_active = options.export_textures && !options.vlm_only && !images.is_empty();
+    let tex_exporter = SemanticTextureExporter::new(
+        images,
+        options.out_dir,
+        options.input_stem,
+        options.max_texture_size,
+        options.pack_orm,
+        export_textures_active,
+    );
+    if export_textures_active {
         println!(
-            "\n[2/5] 正在导出 {} 张内嵌/引用贴图 (max_texture_size={})...",
+            "\n[2/5] 已启用语义感知贴图导出 (源贴图={}, max_texture_size={}, pack_orm={})...",
             images.len(),
             if options.max_texture_size == 0 {
                 "unlimited".to_string()
             } else {
                 options.max_texture_size.to_string()
-            }
+            },
+            options.pack_orm
         );
-        let mut resized_count = 0usize;
-        for (idx, img_data) in images.iter().enumerate() {
-            let rel_path = format!("textures/{}_tex_{}.png", options.input_stem, idx);
-            let abs_path = options.out_dir.join(&rel_path);
-            match save_gltf_image_as_png(img_data, &abs_path, options.max_texture_size) {
-                Ok(was_resized) => {
-                    if was_resized {
-                        resized_count += 1;
-                    }
-                    exported_tex_paths[idx] = Some(rel_path);
-                }
-                Err(err) => {
-                    eprintln!("  [警告] 贴图 #{} 导出 PNG 失败，已跳过: {}", idx, err);
-                }
-            }
-        }
-        if resized_count > 0 {
-            println!("      其中 {} 张超限贴图已降采样至 <= {} px", resized_count, options.max_texture_size);
-        }
     }
 
     // 1.5 预扫描图元引用次数，供 --auto-instance-min 自动实例化复用检测
@@ -389,7 +422,7 @@ pub fn run_scene_export(
 
     let mut ctx = SceneContext {
         buffers,
-        exported_tex_paths: &exported_tex_paths,
+        tex_exporter,
         image_avg_colors: &image_avg_colors,
         options,
         prim_usage_counts,
@@ -445,6 +478,14 @@ pub fn run_scene_export(
         ctx.degenerate_tris_removed,
         ctx.degenerate_prims_skipped
     );
+    if export_textures_active {
+        println!(
+            "      语义贴图导出: 共写出 {} 张 PNG (降采样 {} 张, 自动打包 ORM {} 组)",
+            ctx.tex_exporter.exported_count,
+            ctx.tex_exporter.resized_count,
+            ctx.tex_exporter.orm_packed_count
+        );
+    }
 
     // 3. 构建全局静态遮蔽 BVH（并同步收集静态批次到 VLM 烘焙收集器）
     let mut final_meshlet_instances = Vec::new();
@@ -1383,6 +1424,26 @@ fn gltf_wrap_to_code_and_str(mode: gltf::texture::WrappingMode) -> (u8, String) 
     }
 }
 
+fn extract_uv_transform(transform: gltf::texture::TextureTransform<'_>) -> Option<SceneUvTransform> {
+    let offset = transform.offset();
+    let scale = transform.scale();
+    let rotation = transform.rotation();
+    let is_identity = offset[0].abs() < 1e-6
+        && offset[1].abs() < 1e-6
+        && (scale[0] - 1.0).abs() < 1e-6
+        && (scale[1] - 1.0).abs() < 1e-6
+        && rotation.abs() < 1e-6;
+    if is_identity {
+        None
+    } else {
+        Some(SceneUvTransform {
+            offset,
+            scale,
+            rotation,
+        })
+    }
+}
+
 fn register_or_get_material(
     gltf_mat: &gltf::Material,
     force_alpha_mask: bool,
@@ -1392,7 +1453,19 @@ fn register_or_get_material(
     let base_color = pbr.base_color_factor();
     let metallic = pbr.metallic_factor();
     let roughness = pbr.roughness_factor();
-    let emissive = gltf_mat.emissive_factor();
+    let emissive_strength = gltf_mat.emissive_strength().unwrap_or(1.0);
+    let raw_emissive = gltf_mat.emissive_factor();
+    let emissive = [
+        raw_emissive[0] * emissive_strength,
+        raw_emissive[1] * emissive_strength,
+        raw_emissive[2] * emissive_strength,
+    ];
+    let unlit = gltf_mat.unlit();
+    let ior = gltf_mat.ior().unwrap_or(1.5);
+    let reflectance = gltf_mat
+        .specular()
+        .map(|s| 0.5 * s.specular_factor())
+        .unwrap_or(0.5);
 
     let (alpha_mode_code, alpha_mode_str) = match gltf_mat.alpha_mode() {
         gltf::material::AlphaMode::Opaque => (0u8, "Opaque".to_string()),
@@ -1412,6 +1485,20 @@ fn register_or_get_material(
     let mr_info = pbr.metallic_roughness_texture();
     let occlusion_info = gltf_mat.occlusion_texture();
     let emissive_info = gltf_mat.emissive_texture();
+
+    let uv_transform = base_color_info
+        .as_ref()
+        .and_then(|t| t.texture_transform().and_then(extract_uv_transform))
+        .or_else(|| {
+            mr_info
+                .as_ref()
+                .and_then(|t| t.texture_transform().and_then(extract_uv_transform))
+        })
+        .or_else(|| {
+            emissive_info
+                .as_ref()
+                .and_then(|t| t.texture_transform().and_then(extract_uv_transform))
+        });
 
     let primary_sampler = base_color_info
         .as_ref()
@@ -1437,6 +1524,16 @@ fn register_or_get_material(
     let emissive_tex = emissive_info.map(|t| t.texture().source().index());
     let double_sided = gltf_mat.double_sided();
 
+    let uv_transform_bits = uv_transform.map(|t| {
+        [
+            t.offset[0].to_bits(),
+            t.offset[1].to_bits(),
+            t.scale[0].to_bits(),
+            t.scale[1].to_bits(),
+            t.rotation.to_bits(),
+        ]
+    });
+
     let key = MaterialKey {
         base_color_bits: base_color.map(f32::to_bits),
         metallic_bits: metallic.to_bits(),
@@ -1451,6 +1548,10 @@ fn register_or_get_material(
         emissive_tex,
         double_sided,
         wrap_mode_codes: [wrap_u_code, wrap_v_code],
+        unlit,
+        ior_bits: ior.to_bits(),
+        reflectance_bits: reflectance.to_bits(),
+        uv_transform_bits,
     };
 
     if let Some(&id) = ctx.material_map.get(&key) {
@@ -1458,9 +1559,11 @@ fn register_or_get_material(
     }
 
     let id = ctx.materials.len() as u32;
-    let tex_path = |idx: Option<usize>| -> Option<String> {
-        idx.and_then(|i| ctx.exported_tex_paths.get(i).cloned().flatten())
-    };
+    let base_color_texture = ctx.tex_exporter.export_srgb(base_color_tex);
+    let normal_texture = ctx.tex_exporter.export_normal(normal_tex);
+    let (occlusion_texture, metallic_roughness_texture) =
+        ctx.tex_exporter.export_orm_pair(occlusion_tex, mr_tex);
+    let emissive_texture = ctx.tex_exporter.export_srgb(emissive_tex);
 
     let scene_mat = SceneMaterial {
         id,
@@ -1474,13 +1577,18 @@ fn register_or_get_material(
         emissive,
         alpha_mode: alpha_mode_str,
         alpha_cutoff,
-        base_color_texture: tex_path(base_color_tex),
-        normal_texture: tex_path(normal_tex),
-        metallic_roughness_texture: tex_path(mr_tex),
-        occlusion_texture: tex_path(occlusion_tex),
-        emissive_texture: tex_path(emissive_tex),
+        base_color_texture,
+        normal_texture,
+        metallic_roughness_texture,
+        occlusion_texture,
+        emissive_texture,
         double_sided,
         wrap_mode: [wrap_u_str, wrap_v_str],
+        unlit,
+        ior,
+        reflectance,
+        flip_normal_map_y: false,
+        uv_transform,
     };
     let tex_avg = base_color_tex.and_then(|i| ctx.image_avg_colors.get(i).copied());
     ctx.vlm_materials
@@ -1505,134 +1613,6 @@ fn save_meshlet_mesh(
     ))?;
     std::fs::write(out_file_path, &memory_writer.0)?;
     Ok(())
-}
-
-/// 将 glTF 解码后的像素数据保存为 PNG；若长/宽超过 `max_texture_size`（且不为 0），
-/// 则按比例降采样后再落盘，返回 `Ok(true)` 表示执行过缩放。
-fn save_gltf_image_as_png(
-    data: &gltf::image::Data,
-    out_path: &Path,
-    max_texture_size: u32,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    use gltf::image::Format;
-    let (w, h) = (data.width, data.height);
-
-    let dyn_img: image::DynamicImage = match data.format {
-        Format::R8 => {
-            let buf = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(
-                w,
-                h,
-                data.pixels.clone(),
-            )
-            .ok_or("R8 像素缓冲尺寸与宽高不匹配")?;
-            image::DynamicImage::ImageLuma8(buf)
-        }
-        Format::R8G8 => {
-            let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-            for chunk in data.pixels.chunks_exact(2) {
-                rgb.extend_from_slice(&[chunk[0], chunk[1], 0]);
-            }
-            let buf = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(w, h, rgb)
-                .ok_or("R8G8 像素缓冲尺寸与宽高不匹配")?;
-            image::DynamicImage::ImageRgb8(buf)
-        }
-        Format::R8G8B8 => {
-            let buf = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(
-                w,
-                h,
-                data.pixels.clone(),
-            )
-            .ok_or("R8G8B8 像素缓冲尺寸与宽高不匹配")?;
-            image::DynamicImage::ImageRgb8(buf)
-        }
-        Format::R8G8B8A8 => {
-            let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
-                w,
-                h,
-                data.pixels.clone(),
-            )
-            .ok_or("R8G8B8A8 像素缓冲尺寸与宽高不匹配")?;
-            image::DynamicImage::ImageRgba8(buf)
-        }
-        Format::R16 | Format::R16G16 | Format::R16G16B16 | Format::R16G16B16A16 => {
-            let channels: usize = match data.format {
-                Format::R16 => 1,
-                Format::R16G16 => 2,
-                Format::R16G16B16 => 3,
-                Format::R16G16B16A16 => 4,
-                _ => unreachable!(),
-            };
-            let mut out8 = Vec::with_capacity((w * h) as usize * channels.max(if channels == 2 { 3 } else { channels }));
-            for pixel in data.pixels.chunks_exact(2 * channels) {
-                let c0 = (u16::from_le_bytes([pixel[0], pixel[1]]) >> 8) as u8;
-                if channels == 1 {
-                    out8.push(c0);
-                } else if channels == 2 {
-                    let c1 = (u16::from_le_bytes([pixel[2], pixel[3]]) >> 8) as u8;
-                    out8.extend_from_slice(&[c0, c1, 0]);
-                } else {
-                    for c in 0..channels {
-                        let val = (u16::from_le_bytes([pixel[c * 2], pixel[c * 2 + 1]]) >> 8) as u8;
-                        out8.push(val);
-                    }
-                }
-            }
-            match channels {
-                1 => {
-                    let buf = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(w, h, out8)
-                        .ok_or("R16 像素缓冲尺寸与宽高不匹配")?;
-                    image::DynamicImage::ImageLuma8(buf)
-                }
-                2 | 3 => {
-                    let buf = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(w, h, out8)
-                        .ok_or("R16G16/R16G16B16 像素缓冲尺寸与宽高不匹配")?;
-                    image::DynamicImage::ImageRgb8(buf)
-                }
-                _ => {
-                    let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, out8)
-                        .ok_or("R16G16B16A16 像素缓冲尺寸与宽高不匹配")?;
-                    image::DynamicImage::ImageRgba8(buf)
-                }
-            }
-        }
-        Format::R32G32B32FLOAT | Format::R32G32B32A32FLOAT => {
-            let channels = if matches!(data.format, Format::R32G32B32FLOAT) {
-                3
-            } else {
-                4
-            };
-            let mut out8 = Vec::with_capacity((w * h * channels) as usize);
-            for ch in data.pixels.chunks_exact(4) {
-                let f = f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
-                out8.push((f.clamp(0.0, 1.0) * 255.0) as u8);
-            }
-            if channels == 3 {
-                let buf = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(w, h, out8)
-                    .ok_or("R32F RGB 像素缓冲尺寸与宽高不匹配")?;
-                image::DynamicImage::ImageRgb8(buf)
-            } else {
-                let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, out8)
-                    .ok_or("R32F RGBA 像素缓冲尺寸与宽高不匹配")?;
-                image::DynamicImage::ImageRgba8(buf)
-            }
-        }
-    };
-
-    let mut resized = false;
-    let final_img = if max_texture_size > 0 && (w > max_texture_size || h > max_texture_size) {
-        resized = true;
-        // 双线性（Triangle）按比例缩小到不超过 max_texture_size，兼顾质量与离线导出速度
-        dyn_img.resize(
-            max_texture_size,
-            max_texture_size,
-            image::imageops::FilterType::Triangle,
-        )
-    } else {
-        dyn_img
-    };
-
-    final_img.save_with_format(out_path, image::ImageFormat::Png)?;
-    Ok(resized)
 }
 
 fn parse_world_hdri_from_scene_extras(scene: &gltf::Scene) -> Option<SceneWorldHdri> {

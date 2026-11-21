@@ -1,6 +1,7 @@
 mod ao_baker;
 mod lod_mesh;
 mod scene;
+mod texture_export;
 mod vlm_baker;
 mod vlm_gpu;
 
@@ -57,6 +58,10 @@ struct Args {
     /// 导出贴图的最大边长（像素）；超过该尺寸将按比例降采样，0 表示不限制（针对集显/轻薄本推荐 1024 或 512）
     #[arg(long, default_value_t = 1024)]
     max_texture_size: u32,
+
+    /// 禁用将分离的 Occlusion 与 MetallicRoughness 贴图自动打包为单张标准 ORM 贴图（默认开启自动打包）
+    #[arg(long, default_value_t = false)]
+    no_pack_orm: bool,
 
     /// 场景模式下静态合批的空间网格边长（米），用于自动切分超大房间以便分块流送卸载；0 表示禁用空间切分
     #[arg(long, default_value_t = 12.0)]
@@ -238,6 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dynamic_prefixes: &args.dynamic_prefixes,
             export_textures: args.export_textures,
             max_texture_size: args.max_texture_size,
+            pack_orm: !args.no_pack_orm,
             grid_size: args.grid_size,
             max_batch_tris: args.max_batch_tris,
             auto_instance_min: args.auto_instance_min,

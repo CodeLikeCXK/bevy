@@ -127,6 +127,13 @@ fn pbr_input_from_standard_material(
 @if(VERTEX_UVS)
 pbr_input.material.uv_transform = uv_transform;
 
+@if(MESHLET_MESH_MATERIAL_PASS && VERTEX_UVS) {
+    // Apply uv_transform linear Jacobian (chain rule) so tiled/rotated UVs pick the right mip level.
+    let uv_transform_2x2 = mat2x2<f32>(uv_transform[0].xy, uv_transform[1].xy);
+    bias.ddx_uv = uv_transform_2x2 * bias.ddx_uv;
+    bias.ddy_uv = uv_transform_2x2 * bias.ddy_uv;
+}
+
 @if(VERTEX_UVS && VERTEX_UVS_A)
     var uv = (uv_transform * vec3(in.uv, 1.0)).xy;
 

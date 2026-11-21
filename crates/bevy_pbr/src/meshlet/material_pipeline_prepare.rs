@@ -26,7 +26,6 @@ use bevy_render::{
     view::ExtractedView,
 };
 use bevy_utils::default;
-use core::any::TypeId;
 
 /// A list of `(Material ID, Pipeline, BindGroup)` for a view for use in [`meshlet_main_opaque_pass`](`super::meshlet_main_opaque_pass`).
 #[derive(Component, Deref, DerefMut, Default)]
@@ -37,7 +36,7 @@ pub struct MeshletViewMaterialsMainOpaquePass(pub Vec<(u32, CachedRenderPipeline
 pub fn prepare_material_meshlet_meshes_main_opaque_pass(
     resource_manager: ResMut<ResourceManager>,
     mut instance_manager: ResMut<InstanceManager>,
-    mut cache: Local<HashMap<(MeshPipelineKey, TypeId), CachedRenderPipelineId>>,
+    mut cache: Local<HashMap<ErasedMaterialPipelineKey, CachedRenderPipelineId>>,
     pipeline_cache: Res<PipelineCache>,
     material_pipeline: Res<MaterialPipeline>,
     mesh_pipeline: Res<MeshPipeline>,
@@ -190,20 +189,20 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
                 continue;
             };
 
-            let pipeline_id = if let Some(&id) = cache.get(&(view_key, type_id)) {
+            let erased_key = ErasedMaterialPipelineKey {
+                mesh_key: ErasedMeshPipelineKey::new(view_key),
+                material_key: material.properties.material_key.clone(),
+                type_id,
+            };
+            let pipeline_id = if let Some(&id) = cache.get(&erased_key) {
                 id
             } else {
-                let erased_key = ErasedMaterialPipelineKey {
-                    mesh_key: ErasedMeshPipelineKey::new(view_key),
-                    material_key: material.properties.material_key.clone(),
-                    type_id,
-                };
                 let material_pipeline_specializer = MaterialPipelineSpecializer {
                     pipeline: material_pipeline.clone(),
                     properties: material.properties.clone(),
                 };
-                let Ok(material_pipeline_descriptor) =
-                    material_pipeline_specializer.specialize(erased_key, fake_vertex_buffer_layout)
+                let Ok(material_pipeline_descriptor) = material_pipeline_specializer
+                    .specialize(erased_key.clone(), fake_vertex_buffer_layout)
                 else {
                     continue;
                 };
@@ -259,7 +258,7 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
                 };
 
                 let pipeline_id = pipeline_cache.queue_render_pipeline(pipeline_descriptor);
-                cache.insert((view_key, type_id), pipeline_id);
+                cache.insert(erased_key, pipeline_id);
                 pipeline_id
             };
 
@@ -293,7 +292,7 @@ pub struct MeshletViewMaterialsDeferredGBufferPrepass(
 pub fn prepare_material_meshlet_meshes_prepass(
     resource_manager: ResMut<ResourceManager>,
     mut instance_manager: ResMut<InstanceManager>,
-    mut cache: Local<HashMap<(MeshPipelineKey, TypeId), CachedRenderPipelineId>>,
+    mut cache: Local<HashMap<ErasedMaterialPipelineKey, CachedRenderPipelineId>>,
     pipeline_cache: Res<PipelineCache>,
     prepass_pipeline: Res<PrepassPipeline>,
     material_bind_group_allocators: Res<MaterialBindGroupAllocators>,
@@ -356,30 +355,31 @@ pub fn prepare_material_meshlet_meshes_prepass(
                 continue;
             }
 
+            let mut material_view_key = view_key;
             let material_wants_deferred = matches!(
                 material.properties.render_method,
                 OpaqueRendererMethod::Deferred
             );
             if deferred_prepass.is_some() && material_wants_deferred {
-                view_key |= MeshPipelineKey::DEFERRED_PREPASS;
+                material_view_key |= MeshPipelineKey::DEFERRED_PREPASS;
             } else if normal_prepass.is_none() && motion_vector_prepass.is_none() {
                 continue;
             }
 
-            let pipeline_id = if let Some(&id) = cache.get(&(view_key, type_id)) {
+            let erased_key = ErasedMaterialPipelineKey {
+                mesh_key: ErasedMeshPipelineKey::new(material_view_key),
+                material_key: material.properties.material_key.clone(),
+                type_id,
+            };
+            let pipeline_id = if let Some(&id) = cache.get(&erased_key) {
                 id
             } else {
-                let erased_key = ErasedMaterialPipelineKey {
-                    mesh_key: ErasedMeshPipelineKey::new(view_key),
-                    material_key: material.properties.material_key.clone(),
-                    type_id,
-                };
                 let material_pipeline_specializer = PrepassPipelineSpecializer {
                     pipeline: prepass_pipeline.clone(),
                     properties: material.properties.clone(),
                 };
-                let Ok(material_pipeline_descriptor) =
-                    material_pipeline_specializer.specialize(erased_key, fake_vertex_buffer_layout)
+                let Ok(material_pipeline_descriptor) = material_pipeline_specializer
+                    .specialize(erased_key.clone(), fake_vertex_buffer_layout)
                 else {
                     continue;
                 };
@@ -388,13 +388,15 @@ pub fn prepare_material_meshlet_meshes_prepass(
                 let mut shader_defs = material_fragment.shader_defs;
                 shader_defs.push("MESHLET_MESH_MATERIAL_PASS".into());
 
-                let view_layout = if view_key.contains(MeshPipelineKey::MOTION_VECTOR_PREPASS) {
+                let view_layout = if material_view_key.contains(MeshPipelineKey::MOTION_VECTOR_PREPASS)
+                {
                     prepass_pipeline.view_layout_motion_vectors.clone()
                 } else {
                     prepass_pipeline.view_layout_no_motion_vectors.clone()
                 };
 
-                let fragment_shader = if view_key.contains(MeshPipelineKey::DEFERRED_PREPASS) {
+                let fragment_shader = if material_view_key.contains(MeshPipelineKey::DEFERRED_PREPASS)
+                {
                     material
                         .properties
                         .get_shader(MeshletDeferredFragmentShader)
@@ -451,7 +453,7 @@ pub fn prepare_material_meshlet_meshes_prepass(
                 };
 
                 let pipeline_id = pipeline_cache.queue_render_pipeline(pipeline_descriptor);
-                cache.insert((view_key, type_id), pipeline_id);
+                cache.insert(erased_key, pipeline_id);
                 pipeline_id
             };
 
@@ -466,7 +468,7 @@ pub fn prepare_material_meshlet_meshes_prepass(
             };
 
             let item = (material_id, pipeline_id, (*bind_group).clone());
-            if view_key.contains(MeshPipelineKey::DEFERRED_PREPASS) {
+            if material_view_key.contains(MeshPipelineKey::DEFERRED_PREPASS) {
                 deferred_materials.push(item);
             } else {
                 materials.push(item);
